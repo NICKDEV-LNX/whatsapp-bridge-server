@@ -3,73 +3,74 @@ package main
 
 
 import (
-
+	"bytes"
 	"context"
-
 	"database/sql"
-
 	"encoding/binary"
-
 	"encoding/json"
-
 	"fmt"
-
+	"io"
 	"math"
-
 	"math/rand"
-
 	"net/http"
-
+	"net/url"
 	"os"
-
 	"os/signal"
-
 	"path/filepath"
-
 	"reflect"
-
+	"strconv"
 	"strings"
-
+	"sync"
 	"syscall"
-
 	"time"
 
-
-
 	_ "modernc.org/sqlite"
-
 	"github.com/mdp/qrterminal"
 
-
-
-	"bytes"
-
-
-
 	"go.mau.fi/whatsmeow"
-
 	waProto "go.mau.fi/whatsmeow/binary/proto"
-
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
-
 	"go.mau.fi/whatsmeow/store"
-
 	"go.mau.fi/whatsmeow/store/sqlstore"
-
 	"go.mau.fi/whatsmeow/types"
-
 	"go.mau.fi/whatsmeow/types/events"
-
 	waLog "go.mau.fi/whatsmeow/util/log"
-
 	"google.golang.org/protobuf/proto"
-
 )
 
+var (
+	currentQRCode string
+	qrLock        sync.RWMutex
+)
 
+func registerBridgeWithWorker() {
+	workerURL := os.Getenv("CLOUDFLARE_WORKER_URL")
+	bridgeSecret := os.Getenv("BRIDGE_SECRET")
+	renderURL := os.Getenv("RENDER_EXTERNAL_URL")
+	if renderURL == "" {
+		renderURL = "https://whatsapp-bridge-server-0ia4.onrender.com"
+	}
+	if workerURL != "" && bridgeSecret != "" {
+		payload, _ := json.Marshal(map[string]string{
+			"bridge_url": renderURL,
+			"secret":     bridgeSecret,
+		})
+		for i := 0; i < 8; i++ {
+			resp, err := http.Post(workerURL+"/register-bridge", "application/json", bytes.NewBuffer(payload))
+			if err == nil && resp.StatusCode == 200 {
+				fmt.Printf("[Bridge] Successfully auto-registered %s with Cloudflare Worker!\n", renderURL)
+				resp.Body.Close()
+				break
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
 
 // Message represents a chat message for our client
-
 type Message struct {
 
 	Time      time.Time
@@ -516,29 +517,40 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	if mediaPath != "" {
 
-		// Read media file
-
-		mediaData, err := os.ReadFile(mediaPath)
-
-		if err != nil {
-
-			return false, fmt.Sprintf("Error reading media file: %v", err)
-
+		// Read media file or download from URL
+		var mediaData []byte
+		var fileExt string
+		if strings.HasPrefix(mediaPath, "http://") || strings.HasPrefix(mediaPath, "https://") {
+			fmt.Printf("[Bridge] Downloading media from URL: %s\n", mediaPath)
+			resp, err := http.Get(mediaPath)
+			if err != nil {
+				return false, fmt.Sprintf("Error downloading media from URL: %v", err)
+			}
+			defer resp.Body.Close()
+			mediaData, err = io.ReadAll(resp.Body)
+			if err != nil {
+				return false, fmt.Sprintf("Error reading downloaded media: %v", err)
+			}
+			cleanPath := mediaPath
+			if u, err := url.Parse(mediaPath); err == nil && u.Path != "" {
+				cleanPath = u.Path
+			}
+			fileExt = strings.ToLower(filepath.Ext(cleanPath))
+			fileExt = strings.TrimPrefix(fileExt, ".")
+			if fileExt == "" {
+				fileExt = "mp4"
+			}
+		} else {
+			var err error
+			mediaData, err = os.ReadFile(mediaPath)
+			if err != nil {
+				return false, fmt.Sprintf("Error reading media file: %v", err)
+			}
+			fileExt = strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
 		}
 
-
-
-		// Determine media type and mime type based on file extension
-
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
-
 		var mediaType whatsmeow.MediaType
-
 		var mimeType string
-
-
-
-		// Handle different media types
 
 		switch fileExt {
 
@@ -1442,9 +1454,94 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defaultPort int) {
+	port := defaultPort
+	if pStr := os.Getenv("PORT"); pStr != "" {
+		if p, err := strconv.Atoi(pStr); err == nil {
+			port = p
+		}
+	}
 
-	// Handler for sending messages
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		qrLock.RLock()
+		qr := currentQRCode
+		qrLock.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"qr":        qr,
+			"connected": client != nil && client.IsConnected(),
+			"logged_in": client != nil && client.IsLoggedIn(),
+		})
+	})
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		qrLock.RLock()
+		qr := currentQRCode
+		qrLock.RUnlock()
+		connected := client != nil && client.IsConnected()
+		loggedIn := client != nil && client.IsLoggedIn()
+
+		html := `<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Cloud Bridge</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 32px; max-width: 440px; width: 100%; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); }
+        h1 { margin-top: 0; font-size: 24px; color: #38bdf8; }
+        .status-badge { display: inline-block; padding: 6px 16px; border-radius: 9999px; font-weight: 600; font-size: 14px; margin-bottom: 24px; }
+        .status-connected { background: #065f46; color: #34d399; }
+        .status-waiting { background: #854d0e; color: #fde047; }
+        .qr-container { background: #ffffff; padding: 16px; border-radius: 12px; display: inline-block; margin-bottom: 20px; }
+        .qr-container img { width: 280px; height: 280px; display: block; }
+        p { color: #94a3b8; font-size: 14px; line-height: 1.5; margin: 0 0 16px; }
+        .meta { font-size: 12px; color: #64748b; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>WhatsApp Cloud Bridge</h1>`
+		if connected || loggedIn {
+			html += `
+        <div class="status-badge status-connected">✓ CONECTADO A WHATSAPP</div>
+        <p>El puente en la nube está enlazado correctamente con WhatsApp y listo para recibir envíos desde Telegram.</p>
+        <p style="color: #38bdf8; font-size: 13px;">Registrado con Cloudflare Worker 24/7</p>`
+		} else if qr != "" {
+			qrImgURL := "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + url.QueryEscape(qr)
+			html += fmt.Sprintf(`
+        <div class="status-badge status-waiting">⏳ ESPERANDO ESCANEO</div>
+        <p>Abre WhatsApp en tu teléfono > <b>Dispositivos vinculados</b> > <b>Vincular un dispositivo</b> y escanea este código:</p>
+        <div class="qr-container">
+            <img src="%s" alt="WhatsApp QR Code" />
+        </div>
+        <p>El código se actualiza automáticamente.</p>
+        <script>setTimeout(function(){ location.reload(); }, 4000);</script>`, qrImgURL)
+		} else {
+			html += `
+        <div class="status-badge status-waiting">⏳ GENERANDO QR...</div>
+        <p>Iniciando cliente de WhatsApp en el servidor. Por favor espera unos segundos...</p>
+        <script>setTimeout(function(){ location.reload(); }, 3000);</script>`
+		}
+		html += `
+        <div class="meta">Telegram TikTok HD Downloader &copy; 2026</div>
+    </div>
+</body>
+</html>`
+		w.Write([]byte(html))
+	})
 
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 
@@ -1762,250 +1859,68 @@ func main() {
 
 	defer messageStore.Close()
 
-
-
-	// Create channel to track connection success
-
-	connected := make(chan bool, 1)
-
-
-
-	// Setup event handling for messages and history sync
-
-	client.AddEventHandler(func(evt interface{}) {
-
-		switch v := evt.(type) {
-
-		case *events.Message:
-
-			// Process regular messages
-
-			handleMessage(client, messageStore, v, logger)
-
-
-
-		case *events.HistorySync:
-
-			// Process history sync events
-
-			handleHistorySync(client, messageStore, v, logger)
-
-
-
-		case *events.Connected:
-
-			logger.Infof("Connected to WhatsApp")
-
-			select {
-
-			case connected <- true:
-
-			default:
-
-			}
-
-
-
-		case *events.PairSuccess:
-
-			logger.Infof("PairSuccess: Successfully paired with %s", v.ID)
-
-			select {
-
-			case connected <- true:
-
-			default:
-
-			}
-
-
-
-		case *events.PairError:
-
-			logger.Errorf("PairError from server: %v", v.Error)
-
-
-
-		case *events.LoggedOut:
-
-			logger.Warnf("Device logged out, please scan QR code to log in again")
-
-		}
-
-	})
-
-
-
-	// Connect to WhatsApp
-
-	if client.Store.ID == nil {
-
-		pairPhone := os.Getenv("PAIR_PHONE")
-
-		if pairPhone != "" {
-
-			err = client.Connect()
-
-			if err != nil {
-
-				logger.Errorf("Failed to connect: %v", err)
-
-				return
-
-			}
-
-			code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Windows)")
-
-			if err != nil {
-
-				logger.Errorf("Failed to pair phone: %v", err)
-
-				return
-
-			}
-
-			fmt.Printf("\n=======================================================\n")
-
-			fmt.Printf(">>> CODIGO DE VINCULACION: %s <<<\n", code)
-
-			fmt.Printf("=======================================================\n\n")
-
-			_ = os.WriteFile("store/pairing_code.txt", []byte(code), 0644)
-
-		} else {
-
-			// No ID stored, this is a new client, need to pair with phone
-
-			qrChan, _ := client.GetQRChannel(context.Background())
-
-			err = client.Connect()
-
-			if err != nil {
-
-				logger.Errorf("Failed to connect: %v", err)
-
-				return
-
-			}
-
-
-
-			// Print QR code for pairing with phone
-
-			for evt := range qrChan {
-
-				if evt.Event == "code" {
-
-					fmt.Println("\nScan this QR code with your WhatsApp app:")
-
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-
-					_ = os.WriteFile("store/last_qr.txt", []byte(evt.Code), 0644)
-
-				} else if evt.Event == "success" {
-
-					logger.Infof("QR pairing success!")
-
-					connected <- true
-
-					break
-
-				} else {
-
-					logger.Warnf("QRChannel event: %s (err: %v)", evt.Event, evt.Error)
-
-				}
-
-			}
-
-		}
-
-
-
-		// Wait for connection
-
-		select {
-
-		case <-connected:
-
-			fmt.Println("\nSuccessfully connected and authenticated!")
-
-		case <-time.After(3 * time.Minute):
-
-			logger.Errorf("Timeout waiting for pairing")
-
-			return
-
-		}
-
-	} else {
-
-		// Already logged in, just connect
-
-		err = client.Connect()
-
-		if err != nil {
-
-			logger.Errorf("Failed to connect: %v", err)
-
-			return
-
-		}
-
-		connected <- true
-
-	}
-
-
-
-	// Wait for connection to stabilize (reconnect code 515 might happen)
-
-	for i := 0; i < 30; i++ {
-
-		if client.IsConnected() {
-
-			break
-
-		}
-
-		time.Sleep(500 * time.Millisecond)
-
-	}
-
-
-
-	fmt.Println("\n✓ Connected to WhatsApp! Starting REST API...")
-
-
-
-	// Start REST API server
-
+	// Start REST API server immediately so Cloud hosts (like Render) detect open port instantly
 	startRESTServer(client, messageStore, 8080)
 
+	// Background connection & pairing logic
+	go func() {
+		if deviceStore.ID == nil {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err := client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					qrLock.Lock()
+					currentQRCode = evt.Code
+					qrLock.Unlock()
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					qrLock.Lock()
+					currentQRCode = ""
+					qrLock.Unlock()
+					logger.Infof("QR pairing success!")
+					go registerBridgeWithWorker()
+					break
+				} else {
+					logger.Warnf("QRChannel event: %s (err: %v)", evt.Event, evt.Error)
+				}
+			}
+		} else {
+			err := client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			go registerBridgeWithWorker()
+		}
 
+		// Wait for connection to stabilize
+		for i := 0; i < 30; i++ {
+			if client.IsConnected() {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if client.IsConnected() {
+			fmt.Println("\n✓ Connected to WhatsApp!")
+			go registerBridgeWithWorker()
+		}
+	}()
 
 	// Create a channel to keep the main goroutine alive
-
 	exitChan := make(chan os.Signal, 1)
-
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-
-
 
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
-
-
 	// Wait for termination signal
-
 	<-exitChan
 
-
-
 	fmt.Println("Disconnecting...")
-
-	// Disconnect client
-
 	client.Disconnect()
 
 }
