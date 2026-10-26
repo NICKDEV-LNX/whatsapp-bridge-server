@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -43,30 +44,106 @@ var (
 	qrLock        sync.RWMutex
 )
 
-func registerBridgeWithWorker() {
+func getWorkerConfig() (string, string) {
 	workerURL := os.Getenv("CLOUDFLARE_WORKER_URL")
+	if workerURL == "" {
+		workerURL = "https://tiktok-telegram-bot.shapiamaluci853.workers.dev"
+	}
 	bridgeSecret := os.Getenv("BRIDGE_SECRET")
+	if bridgeSecret == "" {
+		bridgeSecret = "nick_tiktok_secret_2026"
+	}
+	return workerURL, bridgeSecret
+}
+
+func restoreSessionFromWorker() {
+	workerURL, _ := getWorkerConfig()
+	resp, err := http.Get(workerURL + "/restore-session")
+	if err != nil {
+		fmt.Printf("[Restore] Error al conectar con Cloudflare Worker: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Success bool   `json:"success"`
+		DB      string `json:"db"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return
+	}
+	if !data.Success || data.DB == "" {
+		fmt.Println("[Restore] No hay sesión previa guardada en Cloudflare KV.")
+		return
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(data.DB)
+	if err != nil {
+		fmt.Printf("[Restore] Error decodificando sesión base64: %v\n", err)
+		return
+	}
+
+	_ = os.MkdirAll("store", 0755)
+	err = os.WriteFile("store/whatsapp.db", decoded, 0644)
+	if err != nil {
+		fmt.Printf("[Restore] Error guardando store/whatsapp.db: %v\n", err)
+		return
+	}
+	fmt.Printf("[Restore] ¡Sesión de WhatsApp restaurada exitosamente desde Cloudflare KV (%d bytes)!\n", len(decoded))
+}
+
+func backupSessionToWorker() {
+	workerURL, bridgeSecret := getWorkerConfig()
+	time.Sleep(2 * time.Second) // Esperar a que SQLite complete transacciones
+	data, err := os.ReadFile("store/whatsapp.db")
+	if err != nil || len(data) == 0 {
+		return
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	payload, _ := json.Marshal(map[string]string{
+		"secret": bridgeSecret,
+		"db":     encoded,
+	})
+
+	req, err := http.NewRequest("POST", workerURL+"/backup-session", bytes.NewBuffer(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bridge-Secret", bridgeSecret)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		fmt.Printf("[Backup] ¡Sesión de WhatsApp respaldada exitosamente en Cloudflare KV (%d bytes)!\n", len(data))
+	} else {
+		fmt.Printf("[Backup] Error respaldando sesión: %v\n", err)
+	}
+}
+
+func registerBridgeWithWorker() {
+	workerURL, bridgeSecret := getWorkerConfig()
 	renderURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if renderURL == "" {
 		renderURL = "https://whatsapp-bridge-server-0ia4.onrender.com"
 	}
-	if workerURL != "" && bridgeSecret != "" {
-		payload, _ := json.Marshal(map[string]string{
-			"bridge_url": renderURL,
-			"secret":     bridgeSecret,
-		})
-		for i := 0; i < 8; i++ {
-			resp, err := http.Post(workerURL+"/register-bridge", "application/json", bytes.NewBuffer(payload))
-			if err == nil && resp.StatusCode == 200 {
-				fmt.Printf("[Bridge] Successfully auto-registered %s with Cloudflare Worker!\n", renderURL)
-				resp.Body.Close()
-				break
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
-			time.Sleep(3 * time.Second)
+	payload, _ := json.Marshal(map[string]string{
+		"bridge_url": renderURL,
+		"secret":     bridgeSecret,
+	})
+	for i := 0; i < 8; i++ {
+		resp, err := http.Post(workerURL+"/register-bridge", "application/json", bytes.NewBuffer(payload))
+		if err == nil && resp.StatusCode == 200 {
+			fmt.Printf("[Bridge] Successfully auto-registered %s with Cloudflare Worker!\n", renderURL)
+			resp.Body.Close()
+			break
 		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(3 * time.Second)
 	}
 }
 
@@ -1856,79 +1933,47 @@ func main() {
 
 
 	// Create directory for database if it doesn't exist
-
 	if err := os.MkdirAll("store", 0755); err != nil {
-
 		logger.Errorf("Failed to create store directory: %v", err)
-
 		return
-
 	}
 
-
+	// Restaurar sesión de WhatsApp desde Cloudflare KV si la base de datos local aún no existe
+	if fi, err := os.Stat("store/whatsapp.db"); os.IsNotExist(err) || fi.Size() == 0 {
+		restoreSessionFromWorker()
+	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)", dbLog)
-
 	if err != nil {
-
 		logger.Errorf("Failed to connect to database: %v", err)
-
 		return
-
 	}
-
-
 
 	// Get device store - This contains session information
-
 	deviceStore, err := container.GetFirstDevice(context.Background())
-
 	if err != nil {
-
 		logger.Errorf("Failed to get device: %v", err)
-
 		return
-
 	}
-
 	if deviceStore == nil {
-
 		// No device exists, create one
-
 		deviceStore = container.NewDevice()
-
 		logger.Infof("Created new device")
-
 	}
-
-
 
 	// Create client instance
-
 	client := whatsmeow.NewClient(deviceStore, logger)
-
 	if client == nil {
-
 		logger.Errorf("Failed to create WhatsApp client")
-
 		return
-
 	}
-
-
 
 	// Initialize message store
-
 	messageStore, err := NewMessageStore()
-
 	if err != nil {
-
 		logger.Errorf("Failed to initialize message store: %v", err)
-
 		return
-
 	}
-
 	defer messageStore.Close()
 
 	// Start REST API server immediately so Cloud hosts (like Render) detect open port instantly
@@ -1936,38 +1981,71 @@ func main() {
 
 	// Background connection & pairing logic
 	go func() {
-		if deviceStore.ID == nil {
-			qrChan, _ := client.GetQRChannel(context.Background())
-			err := client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
+		for {
+			if client.IsLoggedIn() {
+				logger.Infof("Client is logged in. Exiting pairing loop.")
+				qrLock.Lock()
+				currentQRCode = ""
+				qrLock.Unlock()
+				go backupSessionToWorker()
+				break
 			}
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					qrLock.Lock()
-					currentQRCode = evt.Code
-					qrLock.Unlock()
-					fmt.Println("\nScan this QR code with your WhatsApp app:")
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				} else if evt.Event == "success" {
-					qrLock.Lock()
-					currentQRCode = ""
-					qrLock.Unlock()
-					logger.Infof("QR pairing success!")
-					go registerBridgeWithWorker()
-					break
-				} else {
-					logger.Warnf("QRChannel event: %s (err: %v)", evt.Event, evt.Error)
+
+			if deviceStore.ID == nil {
+				qrChan, err := client.GetQRChannel(context.Background())
+				if err != nil {
+					logger.Errorf("Failed to get QR channel: %v", err)
+					time.Sleep(3 * time.Second)
+					continue
 				}
+
+				if !client.IsConnected() {
+					err = client.Connect()
+					if err != nil {
+						logger.Errorf("Failed to connect: %v", err)
+						time.Sleep(3 * time.Second)
+						continue
+					}
+				}
+
+				for evt := range qrChan {
+					if evt.Event == "code" {
+						qrLock.Lock()
+						currentQRCode = evt.Code
+						qrLock.Unlock()
+						fmt.Println("\nScan this QR code with your WhatsApp app:")
+						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					} else if evt.Event == "success" {
+						qrLock.Lock()
+						currentQRCode = ""
+						qrLock.Unlock()
+						logger.Infof("QR pairing success!")
+						go registerBridgeWithWorker()
+						go backupSessionToWorker()
+						return
+					} else {
+						logger.Warnf("QRChannel event: %s (err: %v)", evt.Event, evt.Error)
+					}
+				}
+
+				// Si el canal de QR finalizó sin emparejamiento, reiniciar para generar un QR nuevo
+				qrLock.Lock()
+				currentQRCode = ""
+				qrLock.Unlock()
+				if !client.IsLoggedIn() {
+					client.Disconnect()
+					time.Sleep(2 * time.Second)
+				}
+			} else {
+				err := client.Connect()
+				if err != nil {
+					logger.Errorf("Failed to connect: %v", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				go registerBridgeWithWorker()
+				break
 			}
-		} else {
-			err := client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
-			go registerBridgeWithWorker()
 		}
 
 		// Wait for connection to stabilize
@@ -1978,8 +2056,8 @@ func main() {
 			time.Sleep(500 * time.Millisecond)
 		}
 		if client.IsConnected() {
-			fmt.Println("\n✓ Connected to WhatsApp!")
-			go registerBridgeWithWorker()
+			logger.Infof("WhatsApp client successfully connected and online!")
+			go backupSessionToWorker()
 		}
 	}()
 
