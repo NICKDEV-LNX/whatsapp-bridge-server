@@ -1489,7 +1489,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		qrLock.RLock()
 		qr := currentQRCode
 		qrLock.RUnlock()
-		connected := client != nil && client.IsConnected()
 		loggedIn := client != nil && client.IsLoggedIn()
 
 		html := `<!DOCTYPE html>
@@ -1629,6 +1628,79 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		})
 
+	})
+
+	// Handler for publishing to WhatsApp (Status & Nick chat) directly from Cloudflare Worker
+	http.HandleFunc("/api/publish", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		type PublishReq struct {
+			Action   string `json:"action"` // "st", "nk", "both"
+			VideoID  string `json:"video_id"`
+			VideoURL string `json:"video_url"`
+			Title    string `json:"title"`
+			Author   string `json:"author"`
+		}
+
+		var req PublishReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.VideoURL == "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "No se proporcionó URL del video para publicar",
+			})
+			return
+		}
+
+		nickLID := "220954894590052@lid"
+		statusBroadcast := "status@broadcast"
+		cleanTitle := req.Title
+		if len(cleanTitle) > 150 {
+			cleanTitle = cleanTitle[:150]
+		}
+		var errs []string
+
+		// Publicar en Estado de WhatsApp
+		if req.Action == "st" || req.Action == "both" {
+			ok, msg := sendWhatsAppMessage(client, statusBroadcast, "", req.VideoURL, nil)
+			if !ok {
+				errs = append(errs, fmt.Sprintf("Estado: %s", msg))
+			} else {
+				fmt.Println("[Bridge Cloud] ¡Publicado en Estado con éxito!")
+			}
+		}
+
+		// Enviar a Nick
+		if req.Action == "nk" || req.Action == "both" {
+			nickMsg := fmt.Sprintf("👋 ¡Hola Nick! Te comparto este video: ✨\n🎬 *%s*", cleanTitle)
+			ok, msg := sendWhatsAppMessage(client, nickLID, nickMsg, req.VideoURL, nil)
+			if !ok {
+				errs = append(errs, fmt.Sprintf("Nick: %s", msg))
+			} else {
+				fmt.Println("[Bridge Cloud] ¡Enviado a Nick con éxito!")
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if len(errs) > 0 {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": strings.Join(errs, ", "),
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Enviado exitosamente a WhatsApp",
+			})
+		}
 	})
 
 
