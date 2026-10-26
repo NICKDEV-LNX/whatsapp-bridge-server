@@ -1514,7 +1514,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 <body>
     <div class="card">
         <h1>WhatsApp Cloud Bridge</h1>`
-		if connected || loggedIn {
+		if loggedIn {
 			html += `
         <div class="status-badge status-connected">✓ CONECTADO A WHATSAPP</div>
         <p>El puente en la nube está enlazado correctamente con WhatsApp y listo para recibir envíos desde Telegram.</p>
