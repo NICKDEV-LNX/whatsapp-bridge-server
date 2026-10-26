@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1115,6 +1116,81 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	}
 
+	// Auto-descargador bidireccional de redes sociales en WhatsApp
+	if content != "" {
+		go handleSocialLinkAutoReply(client, msg, content)
+	}
+
+}
+
+var socialMediaRegex = regexp.MustCompile(`(?i)https?://[^\s]*(?:tiktok\.com|instagram\.com|instagr\.am|youtube\.com|youtu\.be|twitter\.com|x\.com|facebook\.com|fb\.watch)[^\s]*`)
+
+type ScrapeResponse struct {
+	Success bool `json:"success"`
+	Item    struct {
+		ID       string   `json:"id"`
+		Platform string   `json:"platform"`
+		IsImages bool     `json:"isImages"`
+		Images   []string `json:"images"`
+		VideoURL string   `json:"videoUrl"`
+		Title    string   `json:"title"`
+		Author   string   `json:"author"`
+	} `json:"item"`
+	Error string `json:"error"`
+}
+
+func handleSocialLinkAutoReply(client *whatsmeow.Client, msg *events.Message, content string) {
+	if strings.Contains(content, "Descargado por tu Bot") || strings.Contains(content, "⏳ *Descargando") {
+		return
+	}
+	link := socialMediaRegex.FindString(content)
+	if link == "" {
+		return
+	}
+
+	chatJID := msg.Info.Chat.String()
+	fmt.Printf("[AutoBot] Enlace detectado en chat %s: %s\n", chatJID, link)
+
+	// Notificar procesamiento
+	sendWhatsAppMessage(client, chatJID, "⏳ *Descargando contenido...*\n_Extrayendo en máxima resolución sin marcas de agua..._", "", nil)
+
+	workerURL, _ := getWorkerConfig()
+	scrapeEndpoint := fmt.Sprintf("%s/api/scrape?url=%s", workerURL, url.QueryEscape(link))
+
+	httpClient := &http.Client{Timeout: 45 * time.Second}
+	resp, err := httpClient.Get(scrapeEndpoint)
+	if err != nil {
+		fmt.Printf("[AutoBot] Error llamando a scrape: %v\n", err)
+		sendWhatsAppMessage(client, chatJID, "❌ Error de conexión al descargar el video.", "", nil)
+		return
+	}
+	defer resp.Body.Close()
+
+	var scrapeRes ScrapeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&scrapeRes); err != nil || !scrapeRes.Success {
+		fmt.Printf("[AutoBot] Fallo al extraer contenido: %v | err: %s\n", err, scrapeRes.Error)
+		sendWhatsAppMessage(client, chatJID, "⚠️ No se pudo procesar este enlace. Asegúrate de que sea público.", "", nil)
+		return
+	}
+
+	caption := fmt.Sprintf("✨ *%s*\n👤 *%s*\n🤖 *Descargado por tu Bot*", scrapeRes.Item.Title, scrapeRes.Item.Author)
+
+	if scrapeRes.Item.VideoURL != "" {
+		fmt.Printf("[AutoBot] Enviando video a %s (%s)...\n", chatJID, scrapeRes.Item.VideoURL)
+		ok, sendMsg := sendWhatsAppMessage(client, chatJID, caption, scrapeRes.Item.VideoURL, nil)
+		if !ok {
+			fmt.Printf("[AutoBot] Error enviando video: %s\n", sendMsg)
+		}
+	} else if scrapeRes.Item.IsImages && len(scrapeRes.Item.Images) > 0 {
+		for i, imgUrl := range scrapeRes.Item.Images {
+			imgCaption := ""
+			if i == 0 {
+				imgCaption = caption
+			}
+			sendWhatsAppMessage(client, chatJID, imgCaption, imgUrl, nil)
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
 }
 
 
