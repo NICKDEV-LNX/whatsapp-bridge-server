@@ -600,23 +600,56 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		var fileExt string
 		if strings.HasPrefix(mediaPath, "http://") || strings.HasPrefix(mediaPath, "https://") {
 			fmt.Printf("[Bridge] Downloading media from URL: %s\n", mediaPath)
-			resp, err := http.Get(mediaPath)
+			httpReq, err := http.NewRequestWithContext(context.Background(), "GET", mediaPath, nil)
+			if err != nil {
+				return false, fmt.Sprintf("Error creating download request: %v", err)
+			}
+			httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+			httpReq.Header.Set("Referer", "https://www.tiktok.com/")
+			httpReq.Header.Set("Accept", "*/*")
+
+			httpClient := &http.Client{Timeout: 90 * time.Second}
+			resp, err := httpClient.Do(httpReq)
 			if err != nil {
 				return false, fmt.Sprintf("Error downloading media from URL: %v", err)
 			}
 			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return false, fmt.Sprintf("Error downloading media: HTTP %d %s", resp.StatusCode, resp.Status)
+			}
+
 			mediaData, err = io.ReadAll(resp.Body)
 			if err != nil {
 				return false, fmt.Sprintf("Error reading downloaded media: %v", err)
 			}
-			cleanPath := mediaPath
-			if u, err := url.Parse(mediaPath); err == nil && u.Path != "" {
-				cleanPath = u.Path
+
+			if len(mediaData) < 1024 {
+				return false, fmt.Sprintf("Downloaded media is too small (%d bytes), invalid file", len(mediaData))
 			}
-			fileExt = strings.ToLower(filepath.Ext(cleanPath))
-			fileExt = strings.TrimPrefix(fileExt, ".")
-			if fileExt == "" {
+
+			// Detect type from Content-Type header first
+			cType := strings.ToLower(resp.Header.Get("Content-Type"))
+			if strings.Contains(cType, "video") {
 				fileExt = "mp4"
+			} else if strings.Contains(cType, "image") {
+				if strings.Contains(cType, "png") {
+					fileExt = "png"
+				} else if strings.Contains(cType, "webp") {
+					fileExt = "webp"
+				} else {
+					fileExt = "jpg"
+				}
+			} else {
+				cleanPath := mediaPath
+				if u, err := url.Parse(mediaPath); err == nil && u.Path != "" {
+					cleanPath = u.Path
+				}
+				fileExt = strings.ToLower(filepath.Ext(cleanPath))
+				fileExt = strings.TrimPrefix(fileExt, ".")
+				if fileExt == "" {
+					fileExt = "mp4"
+				}
 			}
 		} else {
 			var err error
@@ -1813,9 +1846,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		nickLID := "220954894590052@lid"
+		nickTarget := os.Getenv("NICK_PHONE")
+		if nickTarget == "" {
+			nickTarget = "51917515837"
+		}
+		if !strings.Contains(nickTarget, "@") {
+			nickTarget = nickTarget + "@s.whatsapp.net"
+		}
+
 		statusBroadcast := "status@broadcast"
-		cleanTitle := req.Title
+		cleanTitle := strings.TrimSpace(req.Title)
 		if len(cleanTitle) > 150 {
 			cleanTitle = cleanTitle[:150]
 		}
@@ -1823,7 +1863,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		// Publicar en Estado de WhatsApp
 		if req.Action == "st" || req.Action == "both" {
-			ok, msg := sendWhatsAppMessage(client, statusBroadcast, "", req.VideoURL, nil)
+			statusCaption := cleanTitle
+			ok, msg := sendWhatsAppMessage(client, statusBroadcast, statusCaption, req.VideoURL, nil)
 			if !ok {
 				errs = append(errs, fmt.Sprintf("Estado: %s", msg))
 			} else {
@@ -1834,7 +1875,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		// Enviar a Nick
 		if req.Action == "nk" || req.Action == "both" {
 			nickMsg := fmt.Sprintf("👋 ¡Hola Nick! Te comparto este video: ✨\n🎬 *%s*", cleanTitle)
-			ok, msg := sendWhatsAppMessage(client, nickLID, nickMsg, req.VideoURL, nil)
+			ok, msg := sendWhatsAppMessage(client, nickTarget, nickMsg, req.VideoURL, nil)
 			if !ok {
 				errs = append(errs, fmt.Sprintf("Nick: %s", msg))
 			} else {
