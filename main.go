@@ -59,7 +59,8 @@ func getWorkerConfig() (string, string) {
 
 func restoreSessionFromWorker() {
 	workerURL, _ := getWorkerConfig()
-	resp, err := http.Get(workerURL + "/restore-session")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(workerURL + "/restore-session")
 	if err != nil {
 		fmt.Printf("[Restore] Error al conectar con Cloudflare Worker: %v\n", err)
 		return
@@ -94,6 +95,10 @@ func restoreSessionFromWorker() {
 }
 
 func backupSessionToWorker() {
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		fmt.Println("[Backup] No hay sesión activa/logueada, omitiendo backup a KV.")
+		return
+	}
 	workerURL, bridgeSecret := getWorkerConfig()
 	time.Sleep(2 * time.Second) // Esperar a que SQLite complete transacciones
 	data, err := os.ReadFile("store/whatsapp.db")
@@ -114,7 +119,7 @@ func backupSessionToWorker() {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Bridge-Secret", bridgeSecret)
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err == nil {
 		defer resp.Body.Close()
@@ -1658,11 +1663,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		qrLock.RLock()
 		qr := currentQRCode
 		qrLock.RUnlock()
+		var jidStr string
+		if client != nil && client.Store != nil && client.Store.ID != nil {
+			jidStr = client.Store.ID.String()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"qr":        qr,
 			"connected": client != nil && client.IsConnected(),
 			"logged_in": client != nil && client.IsLoggedIn(),
+			"jid":       jidStr,
 		})
 	})
 
@@ -2066,8 +2076,8 @@ func main() {
 		return
 	}
 
-	// Restaurar sesión de WhatsApp desde Cloudflare KV si la base de datos local aún no existe
-	if fi, err := os.Stat("store/whatsapp.db"); os.IsNotExist(err) || fi.Size() == 0 {
+	// Restaurar sesión de WhatsApp desde Cloudflare KV si la base de datos local no existe o está incompleta (< 100 KB)
+	if fi, err := os.Stat("store/whatsapp.db"); os.IsNotExist(err) || fi.Size() < 100000 {
 		restoreSessionFromWorker()
 	}
 
@@ -2183,8 +2193,8 @@ func main() {
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		if client.IsConnected() {
-			logger.Infof("WhatsApp client successfully connected and online!")
+		if client.IsConnected() && client.Store != nil && client.Store.ID != nil {
+			logger.Infof("WhatsApp client successfully connected and online with JID: %s", client.Store.ID.String())
 			go backupSessionToWorker()
 		}
 	}()
