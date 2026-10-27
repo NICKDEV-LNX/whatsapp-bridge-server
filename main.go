@@ -94,8 +94,8 @@ func restoreSessionFromWorker() {
 	fmt.Printf("[Restore] ¡Sesión de WhatsApp restaurada exitosamente desde Cloudflare KV (%d bytes)!\n", len(decoded))
 }
 
-func backupSessionToWorker() {
-	if client == nil || client.Store == nil || client.Store.ID == nil {
+func backupSessionToWorker(cli *whatsmeow.Client) {
+	if cli == nil || cli.Store == nil || cli.Store.ID == nil {
 		fmt.Println("[Backup] No hay sesión activa/logueada, omitiendo backup a KV.")
 		return
 	}
@@ -2125,7 +2125,7 @@ func main() {
 				qrLock.Lock()
 				currentQRCode = ""
 				qrLock.Unlock()
-				go backupSessionToWorker()
+				go backupSessionToWorker(client)
 				break
 			}
 
@@ -2159,7 +2159,7 @@ func main() {
 						qrLock.Unlock()
 						logger.Infof("QR pairing success!")
 						go registerBridgeWithWorker()
-						go backupSessionToWorker()
+						go backupSessionToWorker(client)
 						return
 					} else {
 						logger.Warnf("QRChannel event: %s (err: %v)", evt.Event, evt.Error)
@@ -2195,7 +2195,7 @@ func main() {
 		}
 		if client.IsConnected() && client.Store != nil && client.Store.ID != nil {
 			logger.Infof("WhatsApp client successfully connected and online with JID: %s", client.Store.ID.String())
-			go backupSessionToWorker()
+			go backupSessionToWorker(client)
 		}
 	}()
 
