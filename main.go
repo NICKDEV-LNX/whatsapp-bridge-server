@@ -1834,12 +1834,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 
 		type PublishReq struct {
-			Action    string `json:"action"` // "st", "nk", "both"
-			VideoID   string `json:"video_id"`
-			VideoURL  string `json:"video_url"`
-			Title     string `json:"title"`
-			Author    string `json:"author"`
-			Recipient string `json:"recipient"` // Optional dynamic recipient
+			Action    string   `json:"action"` // "st", "nk", "both"
+			VideoID   string   `json:"video_id"`
+			VideoURL  string   `json:"video_url"`
+			Images    []string `json:"images,omitempty"`
+			Title     string   `json:"title"`
+			Author    string   `json:"author"`
+			Platform  string   `json:"platform"`
+			Recipient string   `json:"recipient"` // Optional dynamic recipient
 		}
 
 		var req PublishReq
@@ -1848,11 +1850,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		if req.VideoURL == "" {
+		if req.VideoURL == "" && len(req.Images) == 0 {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success": false,
-				"message": "No se proporcionó URL del video para publicar",
+				"message": "No se proporcionó URL del video o imágenes para publicar",
 			})
 			return
 		}
@@ -1877,15 +1879,42 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		statusBroadcast := "status@broadcast"
 		cleanTitle := strings.TrimSpace(req.Title)
-		if len(cleanTitle) > 150 {
-			cleanTitle = cleanTitle[:150]
+		if len(cleanTitle) > 250 {
+			cleanTitle = cleanTitle[:250] + "..."
 		}
+
+		platformName := strings.TrimSpace(req.Platform)
+		if platformName == "" {
+			platformName = "Social Media HD"
+		}
+		authorName := strings.TrimSpace(req.Author)
+		if authorName == "" {
+			authorName = "Creador"
+		}
+
+		// Formato Profesional para WhatsApp
+		var personalMsg string
+		if cleanTitle != "" {
+			personalMsg = fmt.Sprintf("🎬 *%s*\n\n👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", cleanTitle, authorName, platformName)
+		} else {
+			personalMsg = fmt.Sprintf("👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", authorName, platformName)
+		}
+
+		// Formato para Estado de WhatsApp
+		statusCaption := cleanTitle
+		if statusCaption != "" && authorName != "" && authorName != "Creador" {
+			statusCaption = fmt.Sprintf("%s\n\n✨ @%s", cleanTitle, authorName)
+		}
+
 		var errs []string
 
 		// Publicar en Estado de WhatsApp
 		if req.Action == "st" || req.Action == "both" {
-			statusCaption := cleanTitle
-			ok, msg := sendWhatsAppMessage(client, statusBroadcast, statusCaption, req.VideoURL, nil)
+			mediaToStatus := req.VideoURL
+			if mediaToStatus == "" && len(req.Images) > 0 {
+				mediaToStatus = req.Images[0]
+			}
+			ok, msg := sendWhatsAppMessage(client, statusBroadcast, statusCaption, mediaToStatus, nil)
 			if !ok {
 				errs = append(errs, fmt.Sprintf("Estado: %s", msg))
 			} else {
@@ -1893,27 +1922,54 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			}
 		}
 
-		// Enviar a WhatsApp Personal
+		// Enviar a WhatsApp Personal / Chat
 		if req.Action == "nk" || req.Action == "both" {
-			personalMsg := fmt.Sprintf("🎬 *%s*", cleanTitle)
-			ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
-			if !ok {
-				errs = append(errs, fmt.Sprintf("Personal: %s", msg))
+			if len(req.Images) > 0 {
+				totalImgs := len(req.Images)
+				if totalImgs > 10 {
+					totalImgs = 10
+				}
+				for idx := 0; idx < totalImgs; idx++ {
+					imgURL := req.Images[idx]
+					caption := ""
+					if idx == 0 {
+						caption = personalMsg
+					} else {
+						caption = fmt.Sprintf("📸 Foto %d/%d", idx+1, totalImgs)
+					}
+					ok, msg := sendWhatsAppMessage(client, targetRecipient, caption, imgURL, nil)
+					if !ok {
+						errs = append(errs, fmt.Sprintf("Foto %d: %s", idx+1, msg))
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+				fmt.Printf("[Bridge Cloud] ¡Carrusel de %d fotos enviado a %s!\n", totalImgs, targetRecipient)
 			} else {
-				fmt.Printf("[Bridge Cloud] ¡Enviado a %s con éxito!\n", targetRecipient)
+				ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
+				if !ok {
+					errs = append(errs, fmt.Sprintf("Personal: %s", msg))
+				} else {
+					fmt.Printf("[Bridge Cloud] ¡Enviado a %s con éxito!\n", targetRecipient)
+				}
 			}
 		}
+
+		cleanPhone := strings.TrimSuffix(targetRecipient, "@s.whatsapp.net")
+		cleanPhone = strings.TrimSuffix(cleanPhone, "@lid")
 
 		w.Header().Set("Content-Type", "application/json")
 		if len(errs) > 0 {
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"message": strings.Join(errs, ", "),
+				"success":   false,
+				"message":   strings.Join(errs, ", "),
+				"recipient": cleanPhone,
 			})
 		} else {
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": "Enviado exitosamente a WhatsApp",
+				"success":   true,
+				"message":   "Enviado exitosamente a WhatsApp",
+				"recipient": cleanPhone,
+				"wa_link":   fmt.Sprintf("https://wa.me/%s", cleanPhone),
 			})
 		}
 	})
