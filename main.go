@@ -1824,11 +1824,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 
 		type PublishReq struct {
-			Action   string `json:"action"` // "st", "nk", "both"
-			VideoID  string `json:"video_id"`
-			VideoURL string `json:"video_url"`
-			Title    string `json:"title"`
-			Author   string `json:"author"`
+			Action    string `json:"action"` // "st", "nk", "both"
+			VideoID   string `json:"video_id"`
+			VideoURL  string `json:"video_url"`
+			Title     string `json:"title"`
+			Author    string `json:"author"`
+			Recipient string `json:"recipient"` // Optional dynamic recipient
 		}
 
 		var req PublishReq
@@ -1846,12 +1847,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		nickTarget := os.Getenv("NICK_PHONE")
-		if nickTarget == "" {
-			nickTarget = "51917515837"
+		// Dynamic recipient resolution:
+		// 1. If recipient is explicitly passed in the request, use it.
+		// 2. Otherwise, dynamically use the logged-in WhatsApp account (client.Store.ID.ToNonAD()).
+		// 3. Fallback to NICK_PHONE env var or default.
+		var targetRecipient string
+		if req.Recipient != "" {
+			targetRecipient = req.Recipient
+		} else if client != nil && client.Store != nil && client.Store.ID != nil {
+			targetRecipient = client.Store.ID.ToNonAD().String()
+		} else if envPhone := os.Getenv("NICK_PHONE"); envPhone != "" {
+			targetRecipient = envPhone
+		} else {
+			targetRecipient = "51917515837"
 		}
-		if !strings.Contains(nickTarget, "@") {
-			nickTarget = nickTarget + "@s.whatsapp.net"
+		if !strings.Contains(targetRecipient, "@") {
+			targetRecipient = targetRecipient + "@s.whatsapp.net"
 		}
 
 		statusBroadcast := "status@broadcast"
@@ -1872,14 +1883,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			}
 		}
 
-		// Enviar a Nick
+		// Enviar a WhatsApp Personal
 		if req.Action == "nk" || req.Action == "both" {
-			nickMsg := fmt.Sprintf("👋 ¡Hola Nick! Te comparto este video: ✨\n🎬 *%s*", cleanTitle)
-			ok, msg := sendWhatsAppMessage(client, nickTarget, nickMsg, req.VideoURL, nil)
+			personalMsg := fmt.Sprintf("🎬 *%s*", cleanTitle)
+			ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
 			if !ok {
-				errs = append(errs, fmt.Sprintf("Nick: %s", msg))
+				errs = append(errs, fmt.Sprintf("Personal: %s", msg))
 			} else {
-				fmt.Println("[Bridge Cloud] ¡Enviado a Nick con éxito!")
+				fmt.Printf("[Bridge Cloud] ¡Enviado a %s con éxito!\n", targetRecipient)
 			}
 		}
 
