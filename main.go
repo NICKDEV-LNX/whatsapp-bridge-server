@@ -777,6 +777,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 
 		// Create the appropriate message type based on media type
+		var captionPtr *string
+		if strings.TrimSpace(message) != "" {
+			c := strings.TrimSpace(message)
+			captionPtr = &c
+		}
 
 		switch mediaType {
 
@@ -784,7 +789,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 			msg.ImageMessage = &waProto.ImageMessage{
 
-				Caption:       proto.String(message),
+				Caption:       captionPtr,
 
 				Mimetype:      proto.String(mimeType),
 
@@ -868,7 +873,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 			msg.VideoMessage = &waProto.VideoMessage{
 
-				Caption:       proto.String(message),
+				Caption:       captionPtr,
 
 				Mimetype:      proto.String(mimeType),
 
@@ -898,7 +903,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 				FileName:      proto.String(baseName),
 
-				Caption:       proto.String(message),
+				Caption:       captionPtr,
 
 				Mimetype:      proto.String(mimeType),
 
@@ -1878,9 +1883,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 
 		statusBroadcast := "status@broadcast"
-		cleanTitle := strings.TrimSpace(req.Title)
-		if len(cleanTitle) > 250 {
-			cleanTitle = cleanTitle[:250] + "..."
+
+		// Limpiar hashtags del título para que no salgan palabras como #fyp #viral #lyrics
+		rawTitle := strings.TrimSpace(req.Title)
+		var cleanWords []string
+		for _, w := range strings.Fields(rawTitle) {
+			if !strings.HasPrefix(w, "#") {
+				cleanWords = append(cleanWords, w)
+			}
+		}
+		cleanTitle := strings.TrimSpace(strings.Join(cleanWords, " "))
+		if len(cleanTitle) > 200 {
+			cleanTitle = cleanTitle[:200] + "..."
 		}
 
 		platformName := strings.TrimSpace(req.Platform)
@@ -1892,7 +1906,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			authorName = "Creador"
 		}
 
-		// Formato Profesional para WhatsApp
+		// Formato Profesional para WhatsApp Personal
 		var personalMsg string
 		if cleanTitle != "" {
 			personalMsg = fmt.Sprintf("🎬 *%s*\n\n👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", cleanTitle, authorName, platformName)
@@ -1900,25 +1914,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			personalMsg = fmt.Sprintf("👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", authorName, platformName)
 		}
 
-		// Formato para Estado de WhatsApp
-		statusCaption := cleanTitle
-		if statusCaption != "" && authorName != "" && authorName != "Creador" {
-			statusCaption = fmt.Sprintf("%s\n\n✨ @%s", cleanTitle, authorName)
-		}
-
 		var errs []string
 
-		// Publicar en Estado de WhatsApp
+		// Publicar en Estado de WhatsApp (100% LIMPIO: Sin letras, descripciones, subtítulos ni hashtags)
 		if req.Action == "st" || req.Action == "both" {
 			mediaToStatus := req.VideoURL
 			if mediaToStatus == "" && len(req.Images) > 0 {
 				mediaToStatus = req.Images[0]
 			}
+			// Estado completamente limpio sin texto ni pie de foto
+			statusCaption := ""
 			ok, msg := sendWhatsAppMessage(client, statusBroadcast, statusCaption, mediaToStatus, nil)
 			if !ok {
 				errs = append(errs, fmt.Sprintf("Estado: %s", msg))
 			} else {
-				fmt.Println("[Bridge Cloud] ¡Publicado en Estado con éxito!")
+				fmt.Println("[Bridge Cloud] ¡Publicado en Estado con éxito (100% limpio sin texto)!")
 			}
 		}
 
