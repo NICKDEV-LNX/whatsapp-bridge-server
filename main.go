@@ -2219,6 +2219,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			Author    string   `json:"author"`
 			Platform  string   `json:"platform"`
 			Recipient string   `json:"recipient"` // Optional dynamic recipient
+			Caption   string   `json:"caption,omitempty"` // Optional custom caption
 		}
 
 		var req PublishReq
@@ -2280,7 +2281,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		// Formato Profesional para WhatsApp Personal
 		var personalMsg string
-		if cleanTitle != "" {
+		if req.Caption != "" {
+			personalMsg = req.Caption
+		} else if cleanTitle != "" {
 			personalMsg = fmt.Sprintf("🎬 *%s*\n\n👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", cleanTitle, authorName, platformName)
 		} else {
 			personalMsg = fmt.Sprintf("👤 *Autor:* %s\n📱 *Plataforma:* %s\n━━━━━━━━━━━━━━━━━━━━\n⚡ *Descargado con @clianythingbot*", authorName, platformName)
@@ -2294,8 +2297,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			if mediaToStatus == "" && len(req.Images) > 0 {
 				mediaToStatus = req.Images[0]
 			}
-			// Estado completamente limpio sin texto ni pie de foto
-			statusCaption := ""
+			// Estado: Si req.Caption tiene texto, usarlo; de lo contrario, limpio sin texto
+			statusCaption := req.Caption
 
 			clientsToPublish := getLoggedInClients()
 			if len(clientsToPublish) == 0 && client != nil {
