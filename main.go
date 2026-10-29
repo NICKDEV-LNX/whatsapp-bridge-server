@@ -774,8 +774,8 @@ type SendMessageRequest struct {
 
 // sanitizeContactsForStatusPrivacy enforces strict exclusion of all contacts configured in WhatsApp
 // privacy settings ("Mis contactos excepto..."). It reads the blacklist directly from WhatsApp,
-// matches exclusively by phone number (jid.User), and strips full_name from any blacklisted contact
-// in SQLite and memory cache so whatsmeow's internal broadcast loop strictly drops them.
+// handles both LIDs and Phone Numbers, cross-references whatsmeow_lid_map, and deletes excluded contacts
+// from SQLite and memory cache so whatsmeow's internal broadcast loop strictly drops them.
 func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 	if c == nil || c.Store == nil || c.Store.ID == nil {
 		return 0, fmt.Errorf("client not connected")
@@ -790,8 +790,8 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 		return 0, err
 	}
 
-	// 2. Extract blacklisted phone numbers across all privacy lists returned
-	blacklistedPhones := make(map[string]bool)
+	// 2. Extract blacklisted identifiers (both LIDs and Phone Numbers)
+	blacklistedIDs := make(map[string]bool)
 	hasBlacklist := false
 	for _, opt := range privOptions {
 		if opt.Type == types.StatusPrivacyTypeBlacklist {
@@ -799,18 +799,35 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 			for _, j := range opt.List {
 				u := strings.TrimSpace(j.User)
 				if u != "" {
-					blacklistedPhones[u] = true
+					blacklistedIDs[u] = true
+				}
+				// If it is an LID, resolve its Phone Number
+				if j.Server == types.HiddenUserServer || j.Server == "lid" {
+					if c.Store != nil && c.Store.LIDs != nil {
+						if pn, err := c.Store.LIDs.GetPNForLID(ctx, j); err == nil && !pn.IsEmpty() {
+							blacklistedIDs[pn.User] = true
+							fmt.Printf("[StatusPrivacy] Resolved LID %s -> PN %s\n", u, pn.User)
+						}
+					}
+				} else {
+					// If it is a PN, resolve its LID
+					if c.Store != nil && c.Store.LIDs != nil {
+						if lid, err := c.Store.LIDs.GetLIDForPN(ctx, j); err == nil && !lid.IsEmpty() {
+							blacklistedIDs[lid.User] = true
+							fmt.Printf("[StatusPrivacy] Resolved PN %s -> LID %s\n", u, lid.User)
+						}
+					}
 				}
 			}
 		}
 	}
 
-	if !hasBlacklist || len(blacklistedPhones) == 0 {
+	if !hasBlacklist || len(blacklistedIDs) == 0 {
 		fmt.Printf("[StatusPrivacy] Acc %s: No blacklist active (privacy: %v)\n", ownPhone, privOptions)
 		return 0, nil
 	}
 
-	fmt.Printf("[StatusPrivacy] Acc %s: Found %d excluded contacts in WhatsApp blacklist!\n", ownPhone, len(blacklistedPhones))
+	fmt.Printf("[StatusPrivacy] Acc %s: Found %d excluded identifiers in WhatsApp blacklist!\n", ownPhone, len(blacklistedIDs))
 
 	// 3. Open SQLite to sanitize and protect contacts
 	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
@@ -818,6 +835,20 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 		return 0, fmt.Errorf("failed to open db: %w", err)
 	}
 	defer db.Close()
+
+	// Cross-reference with whatsmeow_lid_map in SQLite
+	for id := range blacklistedIDs {
+		var mappedPN string
+		_ = db.QueryRow("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", id).Scan(&mappedPN)
+		if mappedPN != "" {
+			blacklistedIDs[mappedPN] = true
+		}
+		var mappedLID string
+		_ = db.QueryRow("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", id).Scan(&mappedLID)
+		if mappedLID != "" {
+			blacklistedIDs[mappedLID] = true
+		}
+	}
 
 	// 4. Query all contacts for this account
 	rows, err := db.Query("SELECT their_jid, full_name, push_name FROM whatsmeow_contacts WHERE our_jid LIKE ?", ownPhone+"%")
@@ -839,18 +870,29 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 		if err := rows.Scan(&jidStr, &fn, &pn); err != nil {
 			continue
 		}
-		// Extract phone number from JID (e.g. 51912345678@s.whatsapp.net -> 51912345678)
 		parsedJID, _ := types.ParseJID(jidStr)
-		phone := parsedJID.User
-		if phone == "" && strings.Contains(jidStr, "@") {
-			phone = strings.Split(jidStr, "@")[0]
+		contactUser := parsedJID.User
+		if contactUser == "" && strings.Contains(jidStr, "@") {
+			contactUser = strings.Split(jidStr, "@")[0]
 		}
 
-		if blacklistedPhones[phone] {
+		isExcluded := blacklistedIDs[contactUser]
+		if !isExcluded && c.Store != nil && c.Store.LIDs != nil {
+			if parsedJID.Server == types.HiddenUserServer || parsedJID.Server == "lid" {
+				if mappedPN, err := c.Store.LIDs.GetPNForLID(ctx, parsedJID); err == nil && !mappedPN.IsEmpty() {
+					isExcluded = blacklistedIDs[mappedPN.User]
+				}
+			} else {
+				if mappedLID, err := c.Store.LIDs.GetLIDForPN(ctx, parsedJID); err == nil && !mappedLID.IsEmpty() {
+					isExcluded = blacklistedIDs[mappedLID.User]
+				}
+			}
+		}
+
+		if isExcluded {
 			toSanitize = append(toSanitize, jidStr)
 		} else {
-			// Non-blacklisted contact: if full_name is empty, activate if push_name exists
-			if fn == "" && (pn != "" || phone != "") {
+			if fn == "" && (pn != "" || contactUser != "") {
 				toActivate = append(toActivate, contactRecord{theirJID: jidStr, fullName: pn, pushName: pn})
 			}
 		}
@@ -858,17 +900,18 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 
 	sanitizedCount := 0
 	for _, jidStr := range toSanitize {
-		_, _ = db.Exec("UPDATE whatsmeow_contacts SET full_name = '' WHERE our_jid LIKE ? AND their_jid = ?", ownPhone+"%", jidStr)
+		// Delete entirely from SQLite to guarantee whatsmeow cannot see it
+		_, _ = db.Exec("DELETE FROM whatsmeow_contacts WHERE our_jid LIKE ? AND their_jid = ?", ownPhone+"%", jidStr)
 		parsedJID, _ := types.ParseJID(jidStr)
 		_ = c.Store.Contacts.PutContactName(ctx, parsedJID, "", "")
 		sanitizedCount++
-		fmt.Printf("[StatusPrivacy] Acc %s: 🚫 EXCLUDED contact blocked & sanitized: %s\n", ownPhone, jidStr)
+		fmt.Printf("[StatusPrivacy] Acc %s: 🚫 EXCLUDED contact deleted & purged: %s\n", ownPhone, jidStr)
 	}
 
-	// Guarantee every blacklisted phone number has full_name = '' in cache for both s.whatsapp.net and c.us
-	for blPhone := range blacklistedPhones {
-		for _, srv := range []string{"s.whatsapp.net", "c.us"} {
-			blJID := types.JID{User: blPhone, Server: srv}
+	// Guarantee every blacklisted identifier has full_name = '' in cache for all servers
+	for blID := range blacklistedIDs {
+		for _, srv := range []string{"s.whatsapp.net", "c.us", "lid"} {
+			blJID := types.JID{User: blID, Server: srv}
 			_ = c.Store.Contacts.PutContactName(ctx, blJID, "", "")
 		}
 	}
@@ -884,7 +927,7 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 		_ = c.Store.Contacts.PutContactName(ctx, parsedJID, displayName, "")
 	}
 
-	fmt.Printf("[StatusPrivacy] Acc %s: Privacy strictly enforced! %d excluded contacts blocked, %d allowed contacts activated.\n",
+	fmt.Printf("[StatusPrivacy] Acc %s: Privacy strictly enforced! %d excluded contacts purged, %d allowed contacts activated.\n",
 		ownPhone, sanitizedCount, len(toActivate))
 	return sanitizedCount, nil
 }
@@ -2454,6 +2497,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			PrivacyOptions   []types.StatusPrivacy `json:"privacy_options"`
 			BlacklistUsers   []string              `json:"blacklist_users"`
 			BlacklistCount   int                   `json:"blacklist_count"`
+			LIDMapCount      int                   `json:"lid_map_count"`
 			TotalContacts    int                   `json:"total_contacts"`
 			NamedContacts    int                   `json:"named_contacts"`
 			ContactsSample   []map[string]string   `json:"contacts_sample"`
@@ -2484,6 +2528,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 					}
 				}
 
+				lidMapCount := 0
+				db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+				if err == nil {
+					_ = db.QueryRow("SELECT COUNT(*) FROM whatsmeow_lid_map").Scan(&lidMapCount)
+					db.Close()
+				}
+
 				allC, _ := c.Store.Contacts.GetAllContacts(context.Background())
 				namedCount := 0
 				var sample []map[string]string
@@ -2510,6 +2561,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 					PrivacyOptions:   priv,
 					BlacklistUsers:   blUsers,
 					BlacklistCount:   len(blUsers),
+					LIDMapCount:      lidMapCount,
 					TotalContacts:    len(allC),
 					NamedContacts:    namedCount,
 					ContactsSample:   sample,
