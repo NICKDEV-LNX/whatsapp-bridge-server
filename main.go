@@ -772,6 +772,123 @@ type SendMessageRequest struct {
 
 
 
+// sanitizeContactsForStatusPrivacy enforces strict exclusion of all contacts configured in WhatsApp
+// privacy settings ("Mis contactos excepto..."). It reads the blacklist directly from WhatsApp,
+// matches exclusively by phone number (jid.User), and strips full_name from any blacklisted contact
+// in SQLite and memory cache so whatsmeow's internal broadcast loop strictly drops them.
+func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
+	if c == nil || c.Store == nil || c.Store.ID == nil {
+		return 0, fmt.Errorf("client not connected")
+	}
+	ctx := context.Background()
+	ownPhone := c.Store.ID.ToNonAD().User
+
+	// 1. Fetch live Status Privacy settings from WhatsApp server
+	privOptions, err := c.GetStatusPrivacy(ctx)
+	if err != nil {
+		fmt.Printf("[StatusPrivacy] Warning: could not fetch status privacy for %s: %v\n", ownPhone, err)
+		return 0, err
+	}
+
+	// 2. Extract blacklisted phone numbers across all privacy lists returned
+	blacklistedPhones := make(map[string]bool)
+	hasBlacklist := false
+	for _, opt := range privOptions {
+		if opt.Type == types.StatusPrivacyTypeBlacklist {
+			hasBlacklist = true
+			for _, j := range opt.List {
+				u := strings.TrimSpace(j.User)
+				if u != "" {
+					blacklistedPhones[u] = true
+				}
+			}
+		}
+	}
+
+	if !hasBlacklist || len(blacklistedPhones) == 0 {
+		fmt.Printf("[StatusPrivacy] Acc %s: No blacklist active (privacy: %v)\n", ownPhone, privOptions)
+		return 0, nil
+	}
+
+	fmt.Printf("[StatusPrivacy] Acc %s: Found %d excluded contacts in WhatsApp blacklist!\n", ownPhone, len(blacklistedPhones))
+
+	// 3. Open SQLite to sanitize and protect contacts
+	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return 0, fmt.Errorf("failed to open db: %w", err)
+	}
+	defer db.Close()
+
+	// 4. Query all contacts for this account
+	rows, err := db.Query("SELECT their_jid, full_name, push_name FROM whatsmeow_contacts WHERE our_jid LIKE ?", ownPhone+"%")
+	if err != nil {
+		return 0, fmt.Errorf("failed to query contacts: %w", err)
+	}
+	defer rows.Close()
+
+	type contactRecord struct {
+		theirJID string
+		fullName string
+		pushName string
+	}
+	var toSanitize []string
+	var toActivate []contactRecord
+
+	for rows.Next() {
+		var jidStr, fn, pn string
+		if err := rows.Scan(&jidStr, &fn, &pn); err != nil {
+			continue
+		}
+		// Extract phone number from JID (e.g. 51912345678@s.whatsapp.net -> 51912345678)
+		parsedJID, _ := types.ParseJID(jidStr)
+		phone := parsedJID.User
+		if phone == "" && strings.Contains(jidStr, "@") {
+			phone = strings.Split(jidStr, "@")[0]
+		}
+
+		if blacklistedPhones[phone] {
+			toSanitize = append(toSanitize, jidStr)
+		} else {
+			// Non-blacklisted contact: if full_name is empty, activate if push_name exists
+			if fn == "" && (pn != "" || phone != "") {
+				toActivate = append(toActivate, contactRecord{theirJID: jidStr, fullName: pn, pushName: pn})
+			}
+		}
+	}
+
+	sanitizedCount := 0
+	for _, jidStr := range toSanitize {
+		_, _ = db.Exec("UPDATE whatsmeow_contacts SET full_name = '' WHERE our_jid LIKE ? AND their_jid = ?", ownPhone+"%", jidStr)
+		parsedJID, _ := types.ParseJID(jidStr)
+		_ = c.Store.Contacts.PutContactName(ctx, parsedJID, "", "")
+		sanitizedCount++
+		fmt.Printf("[StatusPrivacy] Acc %s: 🚫 EXCLUDED contact blocked & sanitized: %s\n", ownPhone, jidStr)
+	}
+
+	// Guarantee every blacklisted phone number has full_name = '' in cache for both s.whatsapp.net and c.us
+	for blPhone := range blacklistedPhones {
+		for _, srv := range []string{"s.whatsapp.net", "c.us"} {
+			blJID := types.JID{User: blPhone, Server: srv}
+			_ = c.Store.Contacts.PutContactName(ctx, blJID, "", "")
+		}
+	}
+
+	// For non-blacklisted contacts, activate them so they receive the status broadcast
+	for _, rec := range toActivate {
+		displayName := rec.pushName
+		if displayName == "" {
+			displayName = "Contact"
+		}
+		_, _ = db.Exec("UPDATE whatsmeow_contacts SET full_name = ? WHERE our_jid LIKE ? AND their_jid = ?", displayName, ownPhone+"%", rec.theirJID)
+		parsedJID, _ := types.ParseJID(rec.theirJID)
+		_ = c.Store.Contacts.PutContactName(ctx, parsedJID, displayName, "")
+	}
+
+	fmt.Printf("[StatusPrivacy] Acc %s: Privacy strictly enforced! %d excluded contacts blocked, %d allowed contacts activated.\n",
+		ownPhone, sanitizedCount, len(toActivate))
+	return sanitizedCount, nil
+}
+
 // Function to send a WhatsApp message
 
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, mentions []string) (bool, string) {
@@ -824,6 +941,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 			Server: "broadcast",
 
+		}
+
+		// Strictly sanitize and enforce WhatsApp privacy rules before sending to status@broadcast
+		if _, sanitizeErr := sanitizeContactsForStatusPrivacy(client); sanitizeErr != nil {
+			fmt.Printf("[StatusPrivacy] Warning: sanitize failed: %v\n", sanitizeErr)
 		}
 
 	} else if strings.Contains(recipient, "@") {
@@ -2320,6 +2442,106 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(results)
+	})
+
+	// Handler to inspect status privacy and contact status
+	http.HandleFunc("/api/privacy-debug", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.RLock()
+		defer multiLock.RUnlock()
+		type AccDebug struct {
+			Index            int                   `json:"index"`
+			Phone            string                `json:"phone"`
+			PrivacyOptions   []types.StatusPrivacy `json:"privacy_options"`
+			BlacklistUsers   []string              `json:"blacklist_users"`
+			BlacklistCount   int                   `json:"blacklist_count"`
+			TotalContacts    int                   `json:"total_contacts"`
+			NamedContacts    int                   `json:"named_contacts"`
+			ContactsSample   []map[string]string   `json:"contacts_sample"`
+			BlacklistMatches []string              `json:"blacklist_matches"`
+		}
+		var out []AccDebug
+		for i, c := range allClients {
+			if c != nil {
+				phone := ""
+				if c.Store != nil && c.Store.ID != nil {
+					phone = c.Store.ID.ToNonAD().User
+				}
+				priv, err := c.GetStatusPrivacy(context.Background())
+				if err != nil {
+					fmt.Printf("[PrivacyDebug] Acc %d GetStatusPrivacy err: %v\n", i+1, err)
+				}
+				var blUsers []string
+				blMap := make(map[string]bool)
+				for _, p := range priv {
+					if p.Type == types.StatusPrivacyTypeBlacklist {
+						for _, j := range p.List {
+							u := strings.TrimSpace(j.User)
+							if u != "" && !blMap[u] {
+								blMap[u] = true
+								blUsers = append(blUsers, fmt.Sprintf("%s@%s", u, j.Server))
+							}
+						}
+					}
+				}
+
+				allC, _ := c.Store.Contacts.GetAllContacts(context.Background())
+				namedCount := 0
+				var sample []map[string]string
+				var blMatches []string
+				for jid, contact := range allC {
+					if len(contact.FullName) > 0 {
+						namedCount++
+					}
+					if blMap[jid.User] {
+						blMatches = append(blMatches, fmt.Sprintf("%s (%s / %s)", jid.String(), contact.FullName, contact.PushName))
+					}
+					if len(sample) < 15 {
+						sample = append(sample, map[string]string{
+							"jid":       jid.String(),
+							"full_name": contact.FullName,
+							"push_name": contact.PushName,
+						})
+					}
+				}
+
+				out = append(out, AccDebug{
+					Index:            i + 1,
+					Phone:            phone,
+					PrivacyOptions:   priv,
+					BlacklistUsers:   blUsers,
+					BlacklistCount:   len(blUsers),
+					TotalContacts:    len(allC),
+					NamedContacts:    namedCount,
+					ContactsSample:   sample,
+					BlacklistMatches: blMatches,
+				})
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
+	})
+
+	// Handler to manually trigger privacy enforcement on all accounts
+	http.HandleFunc("/api/sanitize-privacy", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.Lock()
+		defer multiLock.Unlock()
+		var logs []string
+		for i, c := range allClients {
+			if c != nil && c.IsConnected() {
+				phone := ""
+				if c.Store != nil && c.Store.ID != nil {
+					phone = c.Store.ID.ToNonAD().User
+				}
+				count, err := sanitizeContactsForStatusPrivacy(c)
+				if err != nil {
+					logs = append(logs, fmt.Sprintf("Acc %d (%s) Error: %v", i+1, phone, err))
+				} else {
+					logs = append(logs, fmt.Sprintf("Acc %d (%s) Success: %d excluded contacts protected", i+1, phone, count))
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "logs": logs})
 	})
 
 	// Handler to force AppState sync to download contacts from WhatsApp
