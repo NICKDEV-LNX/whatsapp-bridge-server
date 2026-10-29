@@ -99,6 +99,7 @@ func startPairingAccount(accIndex int) string {
 
 	newDev := globalContainer.NewDevice()
 	cli := whatsmeow.NewClient(newDev, globalLogger)
+	setupClientEventHandlers(cli)
 	pairingClients[accIndex] = cli
 	pairingQRCodes[accIndex] = ""
 
@@ -201,6 +202,7 @@ func startPhonePairing(accIndex int, phone string) (string, error) {
 
 	newDev := globalContainer.NewDevice()
 	cli := whatsmeow.NewClient(newDev, globalLogger)
+	setupClientEventHandlers(cli)
 	pairingClients[accIndex] = cli
 	pairingQRCodes[accIndex] = ""
 	multiLock.Unlock()
@@ -1388,9 +1390,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Send message
 
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
-
-
+	respSend, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 
@@ -1398,10 +1398,252 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	}
 
-
+	// Record status post for analytics & views tracking
+	if recipientJID.Server == "broadcast" {
+		ownPhone := ""
+		if client.Store != nil && client.Store.ID != nil {
+			ownPhone = client.Store.ID.ToNonAD().User
+		}
+		mediaType := "text"
+		if msg.GetImageMessage() != nil {
+			mediaType = "image"
+		} else if msg.GetVideoMessage() != nil {
+			mediaType = "video"
+		}
+		recordStatusPost(string(respSend.ID), ownPhone, message, mediaType, respSend.Timestamp)
+	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 
+}
+
+// Status Tracker DB & Event Handlers
+func initStatusTrackerDB() error {
+	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS status_posts (
+			id TEXT PRIMARY KEY,
+			account_phone TEXT,
+			caption TEXT,
+			media_type TEXT,
+			created_at DATETIME
+		);
+		CREATE TABLE IF NOT EXISTS status_views (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			status_id TEXT,
+			account_phone TEXT,
+			viewer_jid TEXT,
+			viewer_phone TEXT,
+			viewer_name TEXT,
+			viewed_at DATETIME,
+			UNIQUE(status_id, viewer_phone)
+		);
+		CREATE INDEX IF NOT EXISTS idx_status_views_status_id ON status_views(status_id);
+		CREATE INDEX IF NOT EXISTS idx_status_posts_acc ON status_posts(account_phone);
+	`)
+	if err == nil {
+		fmt.Println("[StatusTracker] Initialized SQLite tables (status_posts, status_views)")
+	}
+	return err
+}
+
+func recordStatusPost(id, accountPhone, caption, mediaType string, createdAt time.Time) {
+	if id == "" {
+		return
+	}
+	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	_, _ = db.Exec(`
+		INSERT INTO status_posts (id, account_phone, caption, media_type, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET caption=excluded.caption
+	`, id, accountPhone, caption, mediaType, createdAt)
+	fmt.Printf("[StatusTracker] 🎬 Recorded status post %s for %s (%s)\n", id, accountPhone, mediaType)
+}
+
+func recordStatusView(statusID, accountPhone, viewerJID, viewerPhone, viewerName string, viewedAt time.Time) {
+	if statusID == "" || viewerPhone == "" {
+		return
+	}
+	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	if viewedAt.IsZero() {
+		viewedAt = time.Now()
+	}
+	res, err := db.Exec(`
+		INSERT OR IGNORE INTO status_views (status_id, account_phone, viewer_jid, viewer_phone, viewer_name, viewed_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, statusID, accountPhone, viewerJID, viewerPhone, viewerName, viewedAt)
+	if err == nil {
+		if rows, _ := res.RowsAffected(); rows > 0 {
+			fmt.Printf("[StatusTracker] 👀 New status view on %s: %s (%s)\n", statusID, viewerName, viewerPhone)
+		}
+	}
+}
+
+func handleReceiptEvent(c *whatsmeow.Client, evt *events.Receipt) {
+	if evt == nil {
+		return
+	}
+	isStatusReceipt := evt.Chat == types.StatusBroadcastJID || evt.Chat.User == "status" || strings.HasPrefix(evt.Chat.String(), "status@")
+	if !isStatusReceipt {
+		return
+	}
+
+	if evt.Type != types.ReceiptTypeRead && evt.Type != types.ReceiptTypeReadSelf {
+		return
+	}
+
+	ownPhone := ""
+	if c.Store != nil && c.Store.ID != nil {
+		ownPhone = c.Store.ID.ToNonAD().User
+	}
+
+	viewerJID := evt.Sender
+	viewerUser := viewerJID.User
+	viewerName := ""
+
+	ctx := context.Background()
+	if c.Store != nil && c.Store.Contacts != nil {
+		if contact, err := c.Store.Contacts.GetContact(ctx, viewerJID); err == nil && contact.Found {
+			if contact.FullName != "" {
+				viewerName = contact.FullName
+			} else if contact.PushName != "" {
+				viewerName = contact.PushName
+			}
+		}
+	}
+
+	if viewerJID.Server == types.HiddenUserServer || viewerJID.Server == "lid" {
+		db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+		if err == nil {
+			defer db.Close()
+			var mappedPN string
+			_ = db.QueryRow("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", viewerUser).Scan(&mappedPN)
+			if mappedPN != "" {
+				viewerUser = mappedPN
+				pnJID := types.JID{User: mappedPN, Server: types.DefaultUserServer}
+				if contact, err := c.Store.Contacts.GetContact(ctx, pnJID); err == nil && contact.Found {
+					if contact.FullName != "" {
+						viewerName = contact.FullName
+					} else if contact.PushName != "" && viewerName == "" {
+						viewerName = contact.PushName
+					}
+				}
+			}
+		}
+	}
+
+	if viewerName == "" {
+		viewerName = "+" + viewerUser
+	}
+
+	ts := evt.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	for _, msgID := range evt.MessageIDs {
+		strMsgID := string(msgID)
+		if strMsgID == "" {
+			continue
+		}
+		recordStatusView(strMsgID, ownPhone, viewerJID.String(), viewerUser, viewerName, ts)
+	}
+}
+
+func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
+	if msg == nil {
+		return
+	}
+	if msg.Info.Chat == types.StatusBroadcastJID || msg.Info.Chat.User == "status" {
+		if msg.Info.IsFromMe {
+			ownPhone := ""
+			if c.Store != nil && c.Store.ID != nil {
+				ownPhone = c.Store.ID.ToNonAD().User
+			}
+			caption := ""
+			mediaType := "text"
+			if msg.Message.GetExtendedTextMessage() != nil {
+				caption = msg.Message.GetExtendedTextMessage().GetText()
+			} else if msg.Message.GetConversation() != "" {
+				caption = msg.Message.GetConversation()
+			} else if msg.Message.GetImageMessage() != nil {
+				mediaType = "image"
+				caption = msg.Message.GetImageMessage().GetCaption()
+			} else if msg.Message.GetVideoMessage() != nil {
+				mediaType = "video"
+				caption = msg.Message.GetVideoMessage().GetCaption()
+			}
+			ts := msg.Info.Timestamp
+			if ts.IsZero() {
+				ts = time.Now()
+			}
+			recordStatusPost(string(msg.Info.ID), ownPhone, caption, mediaType, ts)
+		}
+	}
+}
+
+func setupClientEventHandlers(c *whatsmeow.Client) {
+	if c == nil {
+		return
+	}
+	c.AddEventHandler(func(rawEvt any) {
+		switch evt := rawEvt.(type) {
+		case *events.Receipt:
+			handleReceiptEvent(c, evt)
+		case *events.Message:
+			handleMessageEvent(c, evt)
+		}
+	})
+}
+
+func formatTimeAgo(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	diff := time.Since(t)
+	if diff < time.Minute {
+		return "hace unos segundos"
+	} else if diff < time.Hour {
+		mins := int(diff.Minutes())
+		if mins <= 1 {
+			return "hace 1 min"
+		}
+		return fmt.Sprintf("hace %d min", mins)
+	} else if diff < 24*time.Hour {
+		hrs := int(diff.Hours())
+		mins := int(diff.Minutes()) % 60
+		if hrs == 1 {
+			if mins > 0 {
+				return fmt.Sprintf("hace 1h %dm", mins)
+			}
+			return "hace 1h"
+		}
+		if mins > 0 {
+			return fmt.Sprintf("hace %dh %dm", hrs, mins)
+		}
+		return fmt.Sprintf("hace %d horas", hrs)
+	}
+	days := int(diff.Hours() / 24)
+	if days == 1 {
+		return "hace 1 día"
+	}
+	return fmt.Sprintf("hace %d días", days)
 }
 
 
@@ -2573,6 +2815,228 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		json.NewEncoder(w).Encode(out)
 	})
 
+	// Handler to return status views and viewer analytics
+	http.HandleFunc("/api/status-views", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.RLock()
+		defer multiLock.RUnlock()
+
+		targetAcc := r.URL.Query().Get("account") // optional: "1", "2", or phone number
+		limitStr := r.URL.Query().Get("limit")
+		limit := 5
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 20 {
+			limit = l
+		}
+
+		db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer db.Close()
+
+		type ViewerDetail struct {
+			Phone    string `json:"phone"`
+			Name     string `json:"name"`
+			ViewedAt string `json:"viewed_at"`
+			TimeAgo  string `json:"time_ago"`
+		}
+
+		type StatusSummary struct {
+			StatusID     string         `json:"status_id"`
+			AccountPhone string         `json:"account_phone"`
+			AccountIndex int            `json:"account_index"`
+			Caption      string         `json:"caption"`
+			MediaType    string         `json:"media_type"`
+			CreatedAt    string         `json:"created_at"`
+			TimeAgo      string         `json:"time_ago"`
+			TotalViews   int            `json:"total_views"`
+			Viewers      []ViewerDetail `json:"viewers"`
+		}
+
+		phoneToIdx := make(map[string]int)
+		for idx, c := range allClients {
+			if c != nil && c.Store != nil && c.Store.ID != nil {
+				phoneToIdx[c.Store.ID.ToNonAD().User] = idx + 1
+			}
+		}
+
+		query := `
+			SELECT 
+				id,
+				account_phone,
+				caption,
+				media_type,
+				created_at
+			FROM status_posts
+			ORDER BY created_at DESC
+			LIMIT ?
+		`
+
+		rows, err := db.Query(query, limit)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "statuses": []StatusSummary{}, "total_statuses": 0})
+			return
+		}
+		defer rows.Close()
+
+		var statuses []StatusSummary
+		seenStatusIDs := make(map[string]bool)
+
+		for rows.Next() {
+			var sid, accPhone, caption, mediaType string
+			var createdStr sql.NullString
+			if err := rows.Scan(&sid, &accPhone, &caption, &mediaType, &createdStr); err != nil {
+				continue
+			}
+
+			if targetAcc != "" {
+				idxMatch := strconv.Itoa(phoneToIdx[accPhone])
+				if targetAcc != accPhone && targetAcc != idxMatch {
+					continue
+				}
+			}
+
+			seenStatusIDs[sid] = true
+
+			var createdTime time.Time
+			cStr := ""
+			if createdStr.Valid && createdStr.String != "" {
+				cStr = createdStr.String
+				for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
+					if t, parseErr := time.Parse(layout, cStr); parseErr == nil {
+						createdTime = t
+						break
+					}
+				}
+			}
+
+			vRows, vErr := db.Query(`
+				SELECT viewer_phone, viewer_name, viewed_at
+				FROM status_views
+				WHERE status_id = ?
+				ORDER BY viewed_at ASC
+			`, sid)
+
+			var viewers []ViewerDetail
+			if vErr == nil {
+				for vRows.Next() {
+					var vPhone, vName, vTimeStr string
+					if err := vRows.Scan(&vPhone, &vName, &vTimeStr); err == nil {
+						var vTime time.Time
+						for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
+							if t, parseErr := time.Parse(layout, vTimeStr); parseErr == nil {
+								vTime = t
+								break
+							}
+						}
+						viewers = append(viewers, ViewerDetail{
+							Phone:    vPhone,
+							Name:     vName,
+							ViewedAt: vTimeStr,
+							TimeAgo:  formatTimeAgo(vTime),
+						})
+					}
+				}
+				vRows.Close()
+			}
+
+			statuses = append(statuses, StatusSummary{
+				StatusID:     sid,
+				AccountPhone: accPhone,
+				AccountIndex: phoneToIdx[accPhone],
+				Caption:      caption,
+				MediaType:    mediaType,
+				CreatedAt:    cStr,
+				TimeAgo:      formatTimeAgo(createdTime),
+				TotalViews:   len(viewers),
+				Viewers:      viewers,
+			})
+		}
+
+		// Also check any orphan status_views whose status_id wasn't in status_posts
+		orphanRows, oErr := db.Query(`
+			SELECT status_id, account_phone, MIN(viewed_at) as first_view
+			FROM status_views
+			GROUP BY status_id
+			ORDER BY first_view DESC
+			LIMIT ?
+		`, limit)
+		if oErr == nil {
+			defer orphanRows.Close()
+			for orphanRows.Next() {
+				var sid, accPhone, firstViewStr string
+				if err := orphanRows.Scan(&sid, &accPhone, &firstViewStr); err == nil {
+					if seenStatusIDs[sid] {
+						continue
+					}
+					if targetAcc != "" {
+						idxMatch := strconv.Itoa(phoneToIdx[accPhone])
+						if targetAcc != accPhone && targetAcc != idxMatch {
+							continue
+						}
+					}
+
+					var vTime time.Time
+					for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
+						if t, parseErr := time.Parse(layout, firstViewStr); parseErr == nil {
+							vTime = t
+							break
+						}
+					}
+
+					vRows, vErr := db.Query(`
+						SELECT viewer_phone, viewer_name, viewed_at
+						FROM status_views
+						WHERE status_id = ?
+						ORDER BY viewed_at ASC
+					`, sid)
+					var viewers []ViewerDetail
+					if vErr == nil {
+						for vRows.Next() {
+							var vPhone, vName, vTimeStr string
+							if err := vRows.Scan(&vPhone, &vName, &vTimeStr); err == nil {
+								var vt time.Time
+								for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
+									if t, parseErr := time.Parse(layout, vTimeStr); parseErr == nil {
+										vt = t
+										break
+									}
+								}
+								viewers = append(viewers, ViewerDetail{
+									Phone:    vPhone,
+									Name:     vName,
+									ViewedAt: vTimeStr,
+									TimeAgo:  formatTimeAgo(vt),
+								})
+							}
+						}
+						vRows.Close()
+					}
+
+					statuses = append(statuses, StatusSummary{
+						StatusID:     sid,
+						AccountPhone: accPhone,
+						AccountIndex: phoneToIdx[accPhone],
+						Caption:      "Estado de WhatsApp",
+						MediaType:    "media",
+						CreatedAt:    firstViewStr,
+						TimeAgo:      formatTimeAgo(vTime),
+						TotalViews:   len(viewers),
+						Viewers:      viewers,
+					})
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"total_statuses": len(statuses),
+			"statuses":       statuses,
+		})
+	})
+
 	// Handler to manually trigger privacy enforcement on all accounts
 	http.HandleFunc("/api/sanitize-privacy", func(w http.ResponseWriter, r *http.Request) {
 		multiLock.Lock()
@@ -3159,6 +3623,7 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	setupClientEventHandlers(client)
 
 	multiLock.Lock()
 	allClients = append(allClients, client)
@@ -3166,6 +3631,7 @@ func main() {
 		dev := devices[i]
 		if dev.ID != nil && dev.ID.User != "" {
 			secCli := whatsmeow.NewClient(dev, logger)
+			setupClientEventHandlers(secCli)
 			allClients = append(allClients, secCli)
 			go func(idx int, c *whatsmeow.Client) {
 				if err := c.Connect(); err != nil {
@@ -3178,13 +3644,14 @@ func main() {
 	}
 	multiLock.Unlock()
 
-	// Initialize message store
+	// Initialize message store and status analytics DB
 	messageStore, err := NewMessageStore()
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
 	}
 	defer messageStore.Close()
+	_ = initStatusTrackerDB()
 
 	// Start REST API server immediately so Cloud hosts (like Render) detect open port instantly
 	startRESTServer(client, messageStore, 8080)
