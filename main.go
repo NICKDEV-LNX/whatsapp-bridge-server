@@ -16,10 +16,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -356,6 +358,75 @@ func registerBridgeWithWorker() {
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+var (
+	ytDlpPathCache string
+	ytDlpLock      sync.Mutex
+)
+
+func ensureYtDlp() (string, error) {
+	ytDlpLock.Lock()
+	defer ytDlpLock.Unlock()
+
+	if ytDlpPathCache != "" {
+		if _, err := os.Stat(ytDlpPathCache); err == nil {
+			return ytDlpPathCache, nil
+		}
+	}
+
+	// 1. Check if yt-dlp is in system PATH
+	if p, err := exec.LookPath("yt-dlp"); err == nil {
+		ytDlpPathCache = p
+		return p, nil
+	}
+
+	// 2. Check in TempDir
+	targetPath := filepath.Join(os.TempDir(), "yt-dlp")
+	if runtime.GOOS == "windows" {
+		targetPath += ".exe"
+	}
+
+	if _, err := os.Stat(targetPath); err == nil {
+		ytDlpPathCache = targetPath
+		return targetPath, nil
+	}
+
+	// 3. Download standalone binary
+	downloadURL := "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+	if runtime.GOOS == "windows" {
+		downloadURL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+	}
+
+	fmt.Printf("[YT-DLP] Descargando binario yt-dlp desde %s a %s...\n", downloadURL, targetPath)
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return "", fmt.Errorf("error descargando yt-dlp: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("error HTTP %d descargando yt-dlp", resp.StatusCode)
+	}
+
+	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return "", fmt.Errorf("error creando archivo yt-dlp: %w", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return "", fmt.Errorf("error guardando yt-dlp: %w", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		os.Chmod(targetPath, 0755)
+	}
+
+	fmt.Printf("[YT-DLP] Binario listo en: %s\n", targetPath)
+	ytDlpPathCache = targetPath
+	return targetPath, nil
 }
 
 // Message represents a chat message for our client
@@ -2296,6 +2367,117 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "not_applicable"})
+	})
+
+	// Handler to extract YouTube & YouTube Shorts using yt-dlp
+	http.HandleFunc("/api/extract-youtube", func(w http.ResponseWriter, r *http.Request) {
+		targetURL := r.URL.Query().Get("url")
+		if targetURL == "" && r.Method == http.MethodPost {
+			var body struct {
+				URL string `json:"url"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			targetURL = body.URL
+		}
+		if targetURL == "" {
+			http.Error(w, "Parameter 'url' is required", http.StatusBadRequest)
+			return
+		}
+
+		ytBin, err := ensureYtDlp()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+
+		// Extract YouTube ID
+		re := regexp.MustCompile(`(?:shorts/|v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})`)
+		matches := re.FindStringSubmatch(targetURL)
+		vidID := "yt_clip"
+		if len(matches) > 1 {
+			vidID = matches[1]
+		} else {
+			vidID = fmt.Sprintf("yt_%d", time.Now().UnixNano())
+		}
+
+		outputPath := filepath.Join(os.TempDir(), fmt.Sprintf("yt_%s.mp4", vidID))
+		baseURL := "https://whatsapp-bridge-server-0ia4.onrender.com"
+		if r.Host != "" {
+			scheme := "https"
+			if strings.HasPrefix(r.Host, "localhost") || strings.HasPrefix(r.Host, "127.0.0.1") {
+				scheme = "http"
+			}
+			baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+		}
+		publicMediaURL := fmt.Sprintf("%s/media/youtube/%s.mp4", baseURL, vidID)
+
+		// Check if file already downloaded and valid (>100KB)
+		if fi, err := os.Stat(outputPath); err == nil && fi.Size() > 100000 {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":   true,
+				"id":        vidID,
+				"video_url": publicMediaURL,
+				"cached":    true,
+			})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, ytBin,
+			"--no-warnings",
+			"--remote-components", "ejs:github",
+			"-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
+			"--merge-output-format", "mp4",
+			"-o", outputPath,
+			targetURL,
+		)
+
+		var outBuf, errBuf bytes.Buffer
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("[YT-DLP] Error extracting %s: %v | Stderr: %s\n", targetURL, err, errBuf.String())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("yt-dlp error: %v", err),
+				"details": errBuf.String(),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"id":        vidID,
+			"video_url": publicMediaURL,
+			"cached":    false,
+		})
+	})
+
+	// Handler to serve downloaded YouTube MP4 files directly to Telegram & WhatsApp
+	http.HandleFunc("/media/youtube/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/media/youtube/")
+		name = strings.TrimSuffix(name, ".mp4")
+		re := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+		if !re.MatchString(name) {
+			http.NotFound(w, r)
+			return
+		}
+		targetFile := filepath.Join(os.TempDir(), fmt.Sprintf("yt_%s.mp4", name))
+		if _, err := os.Stat(targetFile); os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		http.ServeFile(w, r, targetFile)
 	})
 
 	// Handler for publishing to WhatsApp (Status & Nick chat) directly from Cloudflare Worker
