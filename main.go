@@ -1468,7 +1468,7 @@ func recordStatusPost(id, accountPhone, caption, mediaType string, createdAt tim
 		INSERT INTO status_posts (id, account_phone, caption, media_type, created_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET caption=excluded.caption
-	`, id, accountPhone, caption, mediaType, createdAt)
+	`, id, accountPhone, caption, mediaType, createdAt.Format(time.RFC3339))
 	fmt.Printf("[StatusTracker] 🎬 Recorded status post %s for %s (%s)\n", id, accountPhone, mediaType)
 }
 
@@ -1487,7 +1487,7 @@ func recordStatusView(statusID, accountPhone, viewerJID, viewerPhone, viewerName
 	res, err := db.Exec(`
 		INSERT OR IGNORE INTO status_views (status_id, account_phone, viewer_jid, viewer_phone, viewer_name, viewed_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, statusID, accountPhone, viewerJID, viewerPhone, viewerName, viewedAt)
+	`, statusID, accountPhone, viewerJID, viewerPhone, viewerName, viewedAt.Format(time.RFC3339))
 	if err == nil {
 		if rows, _ := res.RowsAffected(); rows > 0 {
 			fmt.Printf("[StatusTracker] 👀 New status view on %s: %s (%s)\n", statusID, viewerName, viewerPhone)
@@ -1610,6 +1610,28 @@ func setupClientEventHandlers(c *whatsmeow.Client) {
 			handleMessageEvent(c, evt)
 		}
 	})
+}
+
+func parseFlexibleTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02T15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func formatTimeAgo(t time.Time) string {
@@ -2899,17 +2921,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 			seenStatusIDs[sid] = true
 
-			var createdTime time.Time
 			cStr := ""
-			if createdStr.Valid && createdStr.String != "" {
+			if createdStr.Valid {
 				cStr = createdStr.String
-				for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
-					if t, parseErr := time.Parse(layout, cStr); parseErr == nil {
-						createdTime = t
-						break
-					}
-				}
 			}
+			createdTime := parseFlexibleTime(cStr)
 
 			vRows, vErr := db.Query(`
 				SELECT viewer_phone, viewer_name, viewed_at
@@ -2923,13 +2939,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 				for vRows.Next() {
 					var vPhone, vName, vTimeStr string
 					if err := vRows.Scan(&vPhone, &vName, &vTimeStr); err == nil {
-						var vTime time.Time
-						for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
-							if t, parseErr := time.Parse(layout, vTimeStr); parseErr == nil {
-								vTime = t
-								break
-							}
-						}
+						vTime := parseFlexibleTime(vTimeStr)
 						viewers = append(viewers, ViewerDetail{
 							Phone:    vPhone,
 							Name:     vName,
@@ -2977,13 +2987,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 						}
 					}
 
-					var vTime time.Time
-					for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
-						if t, parseErr := time.Parse(layout, firstViewStr); parseErr == nil {
-							vTime = t
-							break
-						}
-					}
+					vTime := parseFlexibleTime(firstViewStr)
 
 					vRows, vErr := db.Query(`
 						SELECT viewer_phone, viewer_name, viewed_at
@@ -2996,13 +3000,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 						for vRows.Next() {
 							var vPhone, vName, vTimeStr string
 							if err := vRows.Scan(&vPhone, &vName, &vTimeStr); err == nil {
-								var vt time.Time
-								for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"} {
-									if t, parseErr := time.Parse(layout, vTimeStr); parseErr == nil {
-										vt = t
-										break
-									}
-								}
+								vt := parseFlexibleTime(vTimeStr)
 								viewers = append(viewers, ViewerDetail{
 									Phone:    vPhone,
 									Name:     vName,
