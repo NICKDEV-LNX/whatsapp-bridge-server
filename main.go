@@ -43,7 +43,93 @@ import (
 var (
 	currentQRCode string
 	qrLock        sync.RWMutex
+
+	// Multi-account globals
+	multiLock       sync.RWMutex
+	globalContainer *sqlstore.Container
+	globalLogger    waLog.Logger
+	allClients      []*whatsmeow.Client
+	pairingQRCodes  = make(map[int]string)
+	pairingClients  = make(map[int]*whatsmeow.Client)
 )
+
+func getLoggedInClients() []*whatsmeow.Client {
+	multiLock.RLock()
+	defer multiLock.RUnlock()
+	var list []*whatsmeow.Client
+	for _, c := range allClients {
+		if c != nil && c.IsLoggedIn() {
+			list = append(list, c)
+		}
+	}
+	return list
+}
+
+func startPairingAccount(accIndex int) string {
+	multiLock.Lock()
+	defer multiLock.Unlock()
+
+	// Si ya está conectado y logueado
+	if accIndex <= len(allClients) && allClients[accIndex-1] != nil && allClients[accIndex-1].IsLoggedIn() {
+		return ""
+	}
+
+	if qr, exists := pairingQRCodes[accIndex]; exists && qr != "" {
+		return qr
+	}
+
+	if globalContainer == nil {
+		return ""
+	}
+
+	newDev := globalContainer.NewDevice()
+	newCli := whatsmeow.NewClient(newDev, globalLogger)
+	pairingClients[accIndex] = newCli
+
+	go func(targetIdx int, targetCli *whatsmeow.Client) {
+		qrChan, err := targetCli.GetQRChannel(context.Background())
+		if err != nil {
+			if globalLogger != nil {
+				globalLogger.Errorf("[MultiAccount] Error getting QR channel for account %d: %v", targetIdx, err)
+			}
+			return
+		}
+		if !targetCli.IsConnected() {
+			_ = targetCli.Connect()
+		}
+
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				multiLock.Lock()
+				pairingQRCodes[targetIdx] = evt.Code
+				multiLock.Unlock()
+				fmt.Printf("\n[MultiAccount] Scan QR for Account %d:\n", targetIdx)
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			} else if evt.Event == "success" {
+				multiLock.Lock()
+				pairingQRCodes[targetIdx] = ""
+				allClients = append(allClients, targetCli)
+				multiLock.Unlock()
+				if globalLogger != nil {
+					globalLogger.Infof("[MultiAccount] Account %d paired successfully!", targetIdx)
+				}
+				go backupSessionToWorker(targetCli)
+				return
+			}
+		}
+
+		multiLock.Lock()
+		delete(pairingQRCodes, targetIdx)
+		delete(pairingClients, targetIdx)
+		multiLock.Unlock()
+	}(accIndex, newCli)
+
+	time.Sleep(1500 * time.Millisecond)
+	multiLock.RLock()
+	qr := pairingQRCodes[accIndex]
+	multiLock.RUnlock()
+	return qr
+}
 
 func getWorkerConfig() (string, string) {
 	workerURL := os.Getenv("CLOUDFLARE_WORKER_URL")
@@ -1665,6 +1751,38 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 	})
 
 	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		accStr := r.URL.Query().Get("account")
+		accNum := 1
+		if a, err := strconv.Atoi(accStr); err == nil && a >= 1 {
+			accNum = a
+		}
+
+		if accNum > 1 {
+			qr := startPairingAccount(accNum)
+			multiLock.RLock()
+			var isConn, isLog bool
+			var jid string
+			if accNum <= len(allClients) && allClients[accNum-1] != nil {
+				isConn = allClients[accNum-1].IsConnected()
+				isLog = allClients[accNum-1].IsLoggedIn()
+				if allClients[accNum-1].Store != nil && allClients[accNum-1].Store.ID != nil {
+					jid = allClients[accNum-1].Store.ID.String()
+				}
+			}
+			multiLock.RUnlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"account":   accNum,
+				"qr":        qr,
+				"connected": isConn,
+				"logged_in": isLog,
+				"jid":       jid,
+			})
+			return
+		}
+
+		// Cuenta 1 (por defecto)
 		qrLock.RLock()
 		qr := currentQRCode
 		qrLock.RUnlock()
@@ -1674,11 +1792,121 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"account":   1,
 			"qr":        qr,
 			"connected": client != nil && client.IsConnected(),
 			"logged_in": client != nil && client.IsLoggedIn(),
 			"jid":       jidStr,
 		})
+	})
+
+	// Endpoint para listar todas las cuentas de WhatsApp conectadas
+	http.HandleFunc("/api/accounts", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.RLock()
+		defer multiLock.RUnlock()
+
+		type AccInfo struct {
+			Index     int    `json:"index"`
+			Phone     string `json:"phone"`
+			JID       string `json:"jid"`
+			Connected bool   `json:"connected"`
+			LoggedIn  bool   `json:"logged_in"`
+		}
+
+		var accs []AccInfo
+		for i, c := range allClients {
+			if c != nil && c.Store != nil {
+				jid := ""
+				phone := ""
+				if c.Store.ID != nil {
+					jid = c.Store.ID.String()
+					phone = c.Store.ID.User
+				}
+				accs = append(accs, AccInfo{
+					Index:     i + 1,
+					Phone:     phone,
+					JID:       jid,
+					Connected: c.IsConnected(),
+					LoggedIn:  c.IsLoggedIn(),
+				})
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"total":    len(accs),
+			"accounts": accs,
+		})
+	})
+
+	// Página web interactiva para vincular Cuenta 2 (o cualquier cuenta)
+	http.HandleFunc("/pair/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.TrimPrefix(r.URL.Path, "/pair/")
+		accNum := 2
+		if n, err := strconv.Atoi(parts); err == nil && n >= 2 {
+			accNum = n
+		}
+
+		qr := startPairingAccount(accNum)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		multiLock.RLock()
+		var loggedIn bool
+		if accNum <= len(allClients) && allClients[accNum-1] != nil {
+			loggedIn = allClients[accNum-1].IsLoggedIn()
+		}
+		multiLock.RUnlock()
+
+		accTitle := strconv.Itoa(accNum)
+		html := `<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vincular Cuenta ` + accTitle + ` - WhatsApp Bridge</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 32px; max-width: 440px; width: 100%; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); }
+        h1 { margin-top: 0; font-size: 24px; color: #38bdf8; }
+        .badge { display: inline-block; padding: 6px 16px; border-radius: 9999px; font-weight: 600; font-size: 14px; margin-bottom: 24px; }
+        .connected { background: #065f46; color: #34d399; }
+        .waiting { background: #854d0e; color: #fde047; }
+        .qr-container { background: #ffffff; padding: 16px; border-radius: 12px; display: inline-block; margin-bottom: 20px; }
+        .qr-container img { width: 280px; height: 280px; display: block; }
+        p { color: #94a3b8; font-size: 14px; line-height: 1.5; margin: 0 0 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Vincular Cuenta ` + accTitle + ` de WhatsApp</h1>`
+
+		if loggedIn {
+			html += `
+        <div class="badge connected">✓ CUENTA ` + accTitle + ` CONECTADA</div>
+        <p>Esta cuenta de WhatsApp ya está vinculada y lista para publicar estados en simultáneo.</p>`
+		} else if qr != "" {
+			qrImgURL := "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + url.QueryEscape(qr)
+			html += `
+        <div class="badge waiting">⏳ ESCANEAR CON WHATSAPP #` + accTitle + `</div>
+        <p>Abre tu segundo WhatsApp > <b>Dispositivos vinculados</b> > <b>Vincular un dispositivo</b> y escanea este código:</p>
+        <div class="qr-container">
+            <img src="` + qrImgURL + `" alt="QR Code Cuenta ` + accTitle + `" />
+        </div>
+        <p>El código se actualiza automáticamente.</p>
+        <script>setTimeout(function(){ location.reload(); }, 4000);</script>`
+		} else {
+			html += `
+        <div class="badge waiting">⏳ INICIANDO EMPAREJAMIENTO...</div>
+        <p>Generando código de vinculación para la segunda cuenta. Espera unos segundos...</p>
+        <script>setTimeout(function(){ location.reload(); }, 3000);</script>`
+		}
+
+		html += `
+    </div>
+</body>
+</html>`
+		w.Write([]byte(html))
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1917,7 +2145,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		var errs []string
 
-		// Publicar en Estado de WhatsApp (100% LIMPIO: Sin letras, descripciones, subtítulos ni hashtags)
+		// Publicar en Estado de WhatsApp (TODAS las cuentas conectadas)
 		if req.Action == "st" || req.Action == "both" {
 			mediaToStatus := req.VideoURL
 			if mediaToStatus == "" && len(req.Images) > 0 {
@@ -1925,11 +2153,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			}
 			// Estado completamente limpio sin texto ni pie de foto
 			statusCaption := ""
-			ok, msg := sendWhatsAppMessage(client, statusBroadcast, statusCaption, mediaToStatus, nil)
-			if !ok {
-				errs = append(errs, fmt.Sprintf("Estado: %s", msg))
-			} else {
-				fmt.Println("[Bridge Cloud] ¡Publicado en Estado con éxito (100% limpio sin texto)!")
+
+			clientsToPublish := getLoggedInClients()
+			if len(clientsToPublish) == 0 && client != nil {
+				clientsToPublish = append(clientsToPublish, client)
+			}
+
+			for i, c := range clientsToPublish {
+				if c != nil && c.IsConnected() {
+					ok, msg := sendWhatsAppMessage(c, statusBroadcast, statusCaption, mediaToStatus, nil)
+					if !ok {
+						errs = append(errs, fmt.Sprintf("Estado Cuenta %d: %s", i+1, msg))
+					} else {
+						fmt.Printf("[Bridge Cloud] ¡Publicado en Estado Cuenta %d con éxito (100%% limpio sin texto)!\n", i+1)
+					}
+				}
 			}
 		}
 
@@ -2162,24 +2400,47 @@ func main() {
 		return
 	}
 
-	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice(context.Background())
+	globalContainer = container
+	globalLogger = logger
+
+	// Get device stores - This contains session information
+	devices, err := container.GetAllDevices(context.Background())
 	if err != nil {
-		logger.Errorf("Failed to get device: %v", err)
+		logger.Errorf("Failed to get devices: %v", err)
 		return
 	}
-	if deviceStore == nil {
-		// No device exists, create one
-		deviceStore = container.NewDevice()
+	if len(devices) == 0 {
+		dev := container.NewDevice()
+		devices = append(devices, dev)
 		logger.Infof("Created new device")
 	}
 
-	// Create client instance
+	deviceStore := devices[0]
+
+	// Create primary client
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+
+	multiLock.Lock()
+	allClients = append(allClients, client)
+	for i := 1; i < len(devices); i++ {
+		dev := devices[i]
+		if dev.ID != nil {
+			secCli := whatsmeow.NewClient(dev, logger)
+			allClients = append(allClients, secCli)
+			go func(idx int, c *whatsmeow.Client) {
+				if err := c.Connect(); err != nil {
+					logger.Errorf("Failed to connect account %d: %v", idx+1, err)
+				} else {
+					logger.Infof("Account %d connected with JID: %s", idx+1, c.Store.ID.String())
+				}
+			}(i, secCli)
+		}
+	}
+	multiLock.Unlock()
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
