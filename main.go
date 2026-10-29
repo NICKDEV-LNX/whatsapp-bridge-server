@@ -2210,7 +2210,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 
 		type PublishReq struct {
-			Action    string   `json:"action"` // "st", "nk", "both"
+			Action    string   `json:"action"` // "st", "st1", "st2", "both", "nk"
+			Account   int      `json:"account,omitempty"` // 1, 2, or 0 (both)
 			VideoID   string   `json:"video_id"`
 			VideoURL  string   `json:"video_url"`
 			Images    []string `json:"images,omitempty"`
@@ -2237,10 +2238,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		// Dynamic recipient resolution:
-		// 1. If recipient is explicitly passed in the request, use it.
-		// 2. Otherwise, dynamically use the logged-in WhatsApp account (client.Store.ID.ToNonAD()).
-		// 3. Fallback to NICK_PHONE env var or default.
+		// Dynamic recipient resolution for private chat (only if action == "nk")
 		var targetRecipient string
 		if req.Recipient != "" {
 			targetRecipient = req.Recipient
@@ -2290,36 +2288,71 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 
 		var errs []string
+		var successAccNames []string
 
-		// Publicar en Estado de WhatsApp (TODAS las cuentas conectadas)
-		if req.Action == "st" || req.Action == "both" {
+		// 1. PUBLICAR EN ESTADO DE WHATSAPP (st, st1, st2, both)
+		isStatusAction := req.Action == "st" || req.Action == "st1" || req.Action == "st2" || req.Action == "both" || strings.HasPrefix(req.Action, "st")
+		if isStatusAction {
 			mediaToStatus := req.VideoURL
 			if mediaToStatus == "" && len(req.Images) > 0 {
 				mediaToStatus = req.Images[0]
 			}
-			// Estado: Si req.Caption tiene texto, usarlo; de lo contrario, limpio sin texto
 			statusCaption := req.Caption
 
-			clientsToPublish := getLoggedInClients()
-			if len(clientsToPublish) == 0 && client != nil {
-				clientsToPublish = append(clientsToPublish, client)
+			allLoggedIn := getLoggedInClients()
+			if len(allLoggedIn) == 0 && client != nil {
+				allLoggedIn = append(allLoggedIn, client)
 			}
 
-			for i, c := range clientsToPublish {
+			// Determinar a qué cuenta(s) dirigir la publicación
+			targetAcc := req.Account
+			if req.Action == "st1" {
+				targetAcc = 1
+			} else if req.Action == "st2" {
+				targetAcc = 2
+			}
+
+			type accTarget struct {
+				index  int
+				client *whatsmeow.Client
+			}
+			var targets []accTarget
+
+			if targetAcc > 0 {
+				if targetAcc <= len(allLoggedIn) && allLoggedIn[targetAcc-1] != nil {
+					targets = append(targets, accTarget{index: targetAcc, client: allLoggedIn[targetAcc-1]})
+				} else {
+					errs = append(errs, fmt.Sprintf("La Cuenta %d no se encuentra conectada", targetAcc))
+				}
+			} else {
+				for i, c := range allLoggedIn {
+					if c != nil {
+						targets = append(targets, accTarget{index: i + 1, client: c})
+					}
+				}
+			}
+
+			for _, t := range targets {
+				c := t.client
 				if c != nil && c.IsConnected() {
+					phone := ""
+					if c.Store != nil && c.Store.ID != nil {
+						phone = c.Store.ID.ToNonAD().User
+					}
 					ok, msg := sendWhatsAppMessage(c, statusBroadcast, statusCaption, mediaToStatus, nil)
 					if !ok {
-						errs = append(errs, fmt.Sprintf("Estado Cuenta %d: %s", i+1, msg))
+						errs = append(errs, fmt.Sprintf("Cuenta %d (%s): %s", t.index, phone, msg))
 					} else {
-						fmt.Printf("[Bridge Cloud] ¡Publicado en Estado Cuenta %d con éxito (100%% limpio sin texto)!\n", i+1)
+						tag := fmt.Sprintf("Cuenta %d (%s)", t.index, phone)
+						successAccNames = append(successAccNames, tag)
+						fmt.Printf("[Bridge Cloud] ¡Publicado en Estado de %s con éxito!\n", tag)
 					}
 				}
 			}
 		}
 
-		// Enviar a WhatsApp Personal / Chat
-		if req.Action == "nk" || req.Action == "both" {
-			// Si tiene VideoURL y no es explícitamente un post de imágenes, enviar el VIDEO
+		// 2. ENVIAR A CHAT PERSONAL DE WHATSAPP (SOLO SI SE SOLICITA EXPLÍCITAMENTE "nk")
+		if req.Action == "nk" {
 			if req.VideoURL != "" && !req.IsImages {
 				ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
 				if !ok {
@@ -2361,18 +2394,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		cleanPhone = strings.TrimSuffix(cleanPhone, "@lid")
 
 		w.Header().Set("Content-Type", "application/json")
-		if len(errs) > 0 {
+		if len(errs) > 0 && len(successAccNames) == 0 {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success":   false,
 				"message":   strings.Join(errs, ", "),
 				"recipient": cleanPhone,
 			})
 		} else {
+			respMsg := "Publicado exitosamente en Estado de WhatsApp"
+			if len(successAccNames) > 0 {
+				respMsg = fmt.Sprintf("Publicado exitosamente en: %s", strings.Join(successAccNames, " y "))
+			}
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success":   true,
-				"message":   "Enviado exitosamente a WhatsApp",
-				"recipient": cleanPhone,
-				"wa_link":   fmt.Sprintf("https://wa.me/%s", cleanPhone),
+				"success":            true,
+				"message":            respMsg,
+				"accounts_published": successAccNames,
+				"recipient":          cleanPhone,
+				"wa_link":            fmt.Sprintf("https://wa.me/%s", cleanPhone),
 			})
 		}
 	})
