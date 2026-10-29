@@ -30,6 +30,7 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
@@ -2200,6 +2201,78 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		})
 
+	})
+
+	// Handler for querying synced contacts and status privacy for diagnostics
+	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.RLock()
+		defer multiLock.RUnlock()
+		type AccContacts struct {
+			Index         int      `json:"index"`
+			Phone         string   `json:"phone"`
+			TotalContacts int      `json:"total_contacts"`
+			NamedContacts int      `json:"named_contacts"`
+			PrivacyType   string   `json:"privacy_type"`
+			Sample        []string `json:"sample"`
+		}
+		var results []AccContacts
+		for i, c := range allClients {
+			if c != nil && c.Store != nil && c.Store.Contacts != nil {
+				phone := ""
+				if c.Store.ID != nil {
+					phone = c.Store.ID.ToNonAD().User
+				}
+				allC, _ := c.Store.Contacts.GetAllContacts(context.Background())
+				namedCount := 0
+				var sample []string
+				for jid, contact := range allC {
+					if len(contact.FullName) > 0 {
+						namedCount++
+						if len(sample) < 5 {
+							sample = append(sample, fmt.Sprintf("%s (%s)", jid.User, contact.FullName))
+						}
+					}
+				}
+				privacyStr := "unknown"
+				if priv, err := c.GetStatusPrivacy(context.Background()); err == nil && len(priv) > 0 {
+					privacyStr = string(priv[0].Type)
+				}
+				results = append(results, AccContacts{
+					Index:         i + 1,
+					Phone:         phone,
+					TotalContacts: len(allC),
+					NamedContacts: namedCount,
+					PrivacyType:   privacyStr,
+					Sample:        sample,
+				})
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
+	// Handler to force AppState sync to download contacts from WhatsApp
+	http.HandleFunc("/api/sync-contacts", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.RLock()
+		defer multiLock.RUnlock()
+		var logs []string
+		for i, c := range allClients {
+			if c != nil && c.IsConnected() {
+				phone := ""
+				if c.Store != nil && c.Store.ID != nil {
+					phone = c.Store.ID.ToNonAD().User
+				}
+				for _, patch := range appstate.AllPatchNames {
+					if err := c.FetchAppState(context.Background(), patch, false, false); err != nil {
+						logs = append(logs, fmt.Sprintf("Acc %d (%s) Patch %s: %v", i+1, phone, patch, err))
+					} else {
+						logs = append(logs, fmt.Sprintf("Acc %d (%s) Patch %s: synced OK", i+1, phone, patch))
+					}
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "done", "logs": logs})
 	})
 
 	// Handler for publishing to WhatsApp (Status & Nick chat) directly from Cloudflare Worker
