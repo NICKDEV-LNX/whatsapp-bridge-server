@@ -2902,7 +2902,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		defer rows.Close()
 
-		var statuses []StatusSummary
+		statuses := []StatusSummary{}
 		seenStatusIDs := make(map[string]bool)
 
 		for rows.Next() {
@@ -2934,7 +2934,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 				ORDER BY viewed_at ASC
 			`, sid)
 
-			var viewers []ViewerDetail
+			viewers := []ViewerDetail{}
 			if vErr == nil {
 				for vRows.Next() {
 					var vPhone, vName, vTimeStr string
@@ -2995,7 +2995,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 						WHERE status_id = ?
 						ORDER BY viewed_at ASC
 					`, sid)
-					var viewers []ViewerDetail
+					viewers := []ViewerDetail{}
 					if vErr == nil {
 						for vRows.Next() {
 							var vPhone, vName, vTimeStr string
