@@ -1853,57 +1853,6 @@ func extractDirectPathFromURL(url string) string {
 
 
 
-func autoFixContacts() {
-	multiLock.RLock()
-	defer multiLock.RUnlock()
-
-	ctx := context.Background()
-
-	// 1. Recopilar todos los contactos válidos existentes en todas las cuentas
-	masterContacts := make(map[types.JID]string)
-	for _, c := range allClients {
-		if c != nil && c.Store != nil && c.Store.Contacts != nil {
-			contacts, _ := c.Store.Contacts.GetAllContacts(ctx)
-			for jid, contact := range contacts {
-				name := contact.FullName
-				if name == "" {
-					name = contact.PushName
-				}
-				if name == "" {
-					name = jid.User
-				}
-				masterContacts[jid] = name
-			}
-		}
-	}
-
-	// Agregar explícitamente ambas cuentas mutuamente
-	j1 := types.NewJID("51910560649", types.DefaultUserServer)
-	j2 := types.NewJID("51917515837", types.DefaultUserServer)
-	masterContacts[j1] = "Cuenta 1 (Personal)"
-	masterContacts[j2] = "Cuenta 2 (Secundaria)"
-
-	// 2. Propagar a todos los clientes para que todos tengan nombres válidos
-	// Whatsmeow requiere explícitamente que contact.FullName tenga longitud > 0 para StatusBroadcast
-	for i, c := range allClients {
-		if c != nil && c.Store != nil && c.Store.Contacts != nil {
-			phone := ""
-			if c.Store.ID != nil {
-				phone = c.Store.ID.ToNonAD().User
-			}
-			updatedCount := 0
-			for jid, name := range masterContacts {
-				if jid.User == phone {
-					continue
-				}
-				_ = c.Store.Contacts.PutContactName(ctx, jid, "", name)
-				updatedCount++
-			}
-			fmt.Printf("[Contacts] Cuenta %d (%s) sincronizada con %d contactos con nombre para Estados\n", i+1, phone, updatedCount)
-		}
-	}
-}
-
 // Start a REST API server to expose the WhatsApp client functionality
 
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defaultPort int) {
@@ -2256,7 +2205,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 	// Handler for querying synced contacts and status privacy for diagnostics
 	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
-		autoFixContacts()
 		multiLock.RLock()
 		defer multiLock.RUnlock()
 		type AccContacts struct {
@@ -2325,6 +2273,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "done", "logs": logs})
+	})
+
+	// Handler to reset/clean Account 2 contacts so accounts remain 100% isolated
+	http.HandleFunc("/api/reset-account2-contacts", func(w http.ResponseWriter, r *http.Request) {
+		multiLock.Lock()
+		defer multiLock.Unlock()
+		if len(allClients) > 1 && allClients[1] != nil && allClients[1].Store != nil && allClients[1].Store.ID != nil {
+			acc2JID := allClients[1].Store.ID.String()
+			db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+			if err == nil {
+				defer db.Close()
+				res, _ := db.Exec("DELETE FROM whatsmeow_contacts WHERE our_jid = ?", acc2JID)
+				rows := int64(0)
+				if res != nil {
+					rows, _ = res.RowsAffected()
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "account2_contacts_deleted": rows})
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "not_applicable"})
 	})
 
 	// Handler for publishing to WhatsApp (Status & Nick chat) directly from Cloudflare Worker
@@ -2418,7 +2389,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		// 1. PUBLICAR EN ESTADO DE WHATSAPP (st, st1, st2, both)
 		isStatusAction := req.Action == "st" || req.Action == "st1" || req.Action == "st2" || req.Action == "both" || strings.HasPrefix(req.Action, "st")
 		if isStatusAction {
-			autoFixContacts()
 			mediaToStatus := req.VideoURL
 			if mediaToStatus == "" && len(req.Images) > 0 {
 				mediaToStatus = req.Images[0]
