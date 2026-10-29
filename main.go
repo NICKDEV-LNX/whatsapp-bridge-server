@@ -67,68 +67,134 @@ func getLoggedInClients() []*whatsmeow.Client {
 
 func startPairingAccount(accIndex int) string {
 	multiLock.Lock()
-	defer multiLock.Unlock()
 
 	// Si ya está conectado y logueado
 	if accIndex <= len(allClients) && allClients[accIndex-1] != nil && allClients[accIndex-1].IsLoggedIn() {
+		multiLock.Unlock()
 		return ""
 	}
 
 	if qr, exists := pairingQRCodes[accIndex]; exists && qr != "" {
+		multiLock.Unlock()
 		return qr
 	}
 
 	if globalContainer == nil {
+		multiLock.Unlock()
 		return ""
 	}
 
-	newDev := globalContainer.NewDevice()
-	newCli := whatsmeow.NewClient(newDev, globalLogger)
-	pairingClients[accIndex] = newCli
+	var targetCli *whatsmeow.Client
+	if existingCli, exists := pairingClients[accIndex]; exists && existingCli != nil {
+		targetCli = existingCli
+	} else {
+		newDev := globalContainer.NewDevice()
+		targetCli = whatsmeow.NewClient(newDev, globalLogger)
+		pairingClients[accIndex] = targetCli
 
-	go func(targetIdx int, targetCli *whatsmeow.Client) {
-		qrChan, err := targetCli.GetQRChannel(context.Background())
-		if err != nil {
-			if globalLogger != nil {
-				globalLogger.Errorf("[MultiAccount] Error getting QR channel for account %d: %v", targetIdx, err)
+		go func(targetIdx int, cli *whatsmeow.Client) {
+			qrChan, err := cli.GetQRChannel(context.Background())
+			if err != nil {
+				if globalLogger != nil {
+					globalLogger.Errorf("[MultiAccount] Error getting QR channel for account %d: %v", targetIdx, err)
+				}
+				return
 			}
-			return
-		}
-		if !targetCli.IsConnected() {
-			_ = targetCli.Connect()
-		}
+			if !cli.IsConnected() {
+				_ = cli.Connect()
+			}
 
-		for evt := range qrChan {
-			if evt.Event == "code" {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					multiLock.Lock()
+					pairingQRCodes[targetIdx] = evt.Code
+					multiLock.Unlock()
+					fmt.Printf("\n[MultiAccount] Scan QR for Account %d:\n", targetIdx)
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					multiLock.Lock()
+					pairingQRCodes[targetIdx] = ""
+					allClients = append(allClients, cli)
+					multiLock.Unlock()
+					if globalLogger != nil {
+						globalLogger.Infof("[MultiAccount] Account %d paired successfully!", targetIdx)
+					}
+					go backupSessionToWorker(cli)
+					return
+				}
+			}
+
+			multiLock.Lock()
+			delete(pairingQRCodes, targetIdx)
+			delete(pairingClients, targetIdx)
+			multiLock.Unlock()
+		}(accIndex, targetCli)
+	}
+
+	multiLock.Unlock()
+
+	// Polling de hasta 4 segundos para retornar el QR fresco inmediatamente
+	for i := 0; i < 20; i++ {
+		time.Sleep(200 * time.Millisecond)
+		multiLock.RLock()
+		qr, exists := pairingQRCodes[accIndex]
+		multiLock.RUnlock()
+		if exists && qr != "" {
+			return qr
+		}
+	}
+	return ""
+}
+
+func startPhonePairing(accIndex int, phone string) (string, error) {
+	cleanPhone := strings.ReplaceAll(phone, "+", "")
+	cleanPhone = strings.ReplaceAll(cleanPhone, " ", "")
+	cleanPhone = strings.ReplaceAll(cleanPhone, "-", "")
+
+	multiLock.Lock()
+	if globalContainer == nil {
+		multiLock.Unlock()
+		return "", fmt.Errorf("database container not initialized")
+	}
+
+	newDev := globalContainer.NewDevice()
+	cli := whatsmeow.NewClient(newDev, globalLogger)
+	pairingClients[accIndex] = cli
+	multiLock.Unlock()
+
+	if !cli.IsConnected() {
+		err := cli.Connect()
+		if err != nil {
+			return "", fmt.Errorf("failed to connect client: %v", err)
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+
+	code, err := cli.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Windows)")
+	if err != nil {
+		return "", fmt.Errorf("failed to pair with phone: %v", err)
+	}
+
+	// Escuchar éxito de emparejamiento en segundo plano
+	go func(targetIdx int, targetCli *whatsmeow.Client) {
+		for i := 0; i < 120; i++ {
+			time.Sleep(2 * time.Second)
+			if targetCli.IsLoggedIn() {
 				multiLock.Lock()
-				pairingQRCodes[targetIdx] = evt.Code
-				multiLock.Unlock()
-				fmt.Printf("\n[MultiAccount] Scan QR for Account %d:\n", targetIdx)
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				multiLock.Lock()
-				pairingQRCodes[targetIdx] = ""
 				allClients = append(allClients, targetCli)
+				delete(pairingClients, targetIdx)
 				multiLock.Unlock()
 				if globalLogger != nil {
-					globalLogger.Infof("[MultiAccount] Account %d paired successfully!", targetIdx)
+					globalLogger.Infof("[MultiAccount] Phone pairing success for Account %d!", targetIdx)
 				}
 				go backupSessionToWorker(targetCli)
 				return
 			}
 		}
+	}(accIndex, cli)
 
-		multiLock.Lock()
-		delete(pairingQRCodes, targetIdx)
-		delete(pairingClients, targetIdx)
-		multiLock.Unlock()
-	}(accIndex, newCli)
-
-	time.Sleep(1500 * time.Millisecond)
-	multiLock.RLock()
-	qr := pairingQRCodes[accIndex]
-	multiLock.RUnlock()
-	return qr
+	return code, nil
 }
 
 func getWorkerConfig() (string, string) {
@@ -1752,12 +1818,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
 		accStr := r.URL.Query().Get("account")
+		phone := r.URL.Query().Get("phone")
 		accNum := 1
 		if a, err := strconv.Atoi(accStr); err == nil && a >= 1 {
 			accNum = a
 		}
 
 		if accNum > 1 {
+			// Si se envió un número telefónico, generar código de 8 dígitos para vincular sin cámara
+			if phone != "" {
+				code, err := startPhonePairing(accNum, phone)
+				w.Header().Set("Content-Type", "application/json")
+				if err != nil {
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"account": accNum,
+						"error":   err.Error(),
+					})
+				} else {
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success":      true,
+						"account":      accNum,
+						"pairing_code": code,
+					})
+				}
+				return
+			}
+
 			qr := startPairingAccount(accNum)
 			multiLock.RLock()
 			var isConn, isLog bool
