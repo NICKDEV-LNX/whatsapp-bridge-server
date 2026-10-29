@@ -1843,6 +1843,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			VideoID   string   `json:"video_id"`
 			VideoURL  string   `json:"video_url"`
 			Images    []string `json:"images,omitempty"`
+			IsImages  bool     `json:"is_images,omitempty"`
 			Title     string   `json:"title"`
 			Author    string   `json:"author"`
 			Platform  string   `json:"platform"`
@@ -1934,7 +1935,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 		// Enviar a WhatsApp Personal / Chat
 		if req.Action == "nk" || req.Action == "both" {
-			if len(req.Images) > 0 {
+			// Si tiene VideoURL y no es explícitamente un post de imágenes, enviar el VIDEO
+			if req.VideoURL != "" && !req.IsImages {
+				ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
+				if !ok {
+					errs = append(errs, fmt.Sprintf("Personal Video: %s", msg))
+				} else {
+					fmt.Printf("[Bridge Cloud] ¡Video enviado a %s con éxito!\n", targetRecipient)
+				}
+			} else if len(req.Images) > 0 {
 				totalImgs := len(req.Images)
 				if totalImgs > 10 {
 					totalImgs = 10
@@ -1954,7 +1963,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 					time.Sleep(300 * time.Millisecond)
 				}
 				fmt.Printf("[Bridge Cloud] ¡Carrusel de %d fotos enviado a %s!\n", totalImgs, targetRecipient)
-			} else {
+			} else if req.VideoURL != "" {
 				ok, msg := sendWhatsAppMessage(client, targetRecipient, personalMsg, req.VideoURL, nil)
 				if !ok {
 					errs = append(errs, fmt.Sprintf("Personal: %s", msg))
