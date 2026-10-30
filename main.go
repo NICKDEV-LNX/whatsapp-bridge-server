@@ -1474,9 +1474,22 @@ func initStatusTrackerDB() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_status_views_status_id ON status_views(status_id);
 		CREATE INDEX IF NOT EXISTS idx_status_posts_acc ON status_posts(account_phone);
+
+		CREATE TABLE IF NOT EXISTS view_once_intercepts (
+			id TEXT PRIMARY KEY,
+			account_phone TEXT,
+			sender_jid TEXT,
+			sender_phone TEXT,
+			sender_name TEXT,
+			media_type TEXT,
+			filename TEXT,
+			caption TEXT,
+			created_at DATETIME
+		);
+		CREATE INDEX IF NOT EXISTS idx_vo_intercepts_acc ON view_once_intercepts(account_phone);
 	`)
 	if err == nil {
-		fmt.Println("[StatusTracker] Initialized SQLite tables (status_posts, status_views)")
+		fmt.Println("[StatusTracker] Initialized SQLite tables (status_posts, status_views, view_once_intercepts)")
 	}
 	return err
 }
@@ -1595,10 +1608,151 @@ func handleReceiptEvent(c *whatsmeow.Client, evt *events.Receipt) {
 	}
 }
 
+func handleViewOnceIntercept(c *whatsmeow.Client, msg *events.Message, inner *waProto.Message) {
+	if c == nil || msg == nil || inner == nil {
+		return
+	}
+
+	senderJID := msg.Info.Sender
+	if senderJID.IsEmpty() {
+		senderJID = msg.Info.Chat
+	}
+	senderUser := senderJID.User
+	ctx := context.Background()
+
+	// Get contact name if possible
+	senderName := ""
+	if c.Store != nil && c.Store.Contacts != nil {
+		if contact, err := c.Store.Contacts.GetContact(ctx, senderJID); err == nil && contact.Found {
+			if contact.FullName != "" {
+				senderName = contact.FullName
+			} else if contact.PushName != "" {
+				senderName = contact.PushName
+			}
+		}
+	}
+	if senderName == "" && msg.Info.PushName != "" {
+		senderName = msg.Info.PushName
+	}
+	if senderName == "" {
+		senderName = "+" + senderUser
+	}
+
+	ownPhone := ""
+	if c.Store != nil && c.Store.ID != nil {
+		ownPhone = c.Store.ID.ToNonAD().User
+	}
+
+	multiLock.RLock()
+	accIdx := 0
+	for idx, cli := range allClients {
+		if cli == c {
+			accIdx = idx + 1
+			break
+		}
+	}
+	multiLock.RUnlock()
+
+	var mediaType string
+	var ext string
+	var caption string
+	var isVideo bool
+
+	if img := inner.GetImageMessage(); img != nil {
+		mediaType = "image"
+		ext = "jpg"
+		caption = img.GetCaption()
+	} else if vid := inner.GetVideoMessage(); vid != nil {
+		mediaType = "video"
+		ext = "mp4"
+		isVideo = true
+		caption = vid.GetCaption()
+	} else if aud := inner.GetAudioMessage(); aud != nil {
+		mediaType = "audio"
+		ext = "ogg"
+		caption = "Audio de Vista Única"
+	} else {
+		fmt.Printf("[AntiViewOnce] Unrecognized inner media type for msg %s\n", msg.Info.ID)
+		return
+	}
+
+	fmt.Printf("[AntiViewOnce] 🚨 Intercepted ViewOnce %s from %s (+%s) to Acc %d (%s)!\n",
+		mediaType, senderName, senderUser, accIdx, ownPhone)
+
+	// Download media bytes using whatsmeow
+	data, err := c.DownloadAny(context.Background(), inner)
+	if err != nil {
+		fmt.Printf("[AntiViewOnce] ❌ Failed to download ViewOnce media %s: %v\n", msg.Info.ID, err)
+		return
+	}
+
+	// Ensure directory exists
+	_ = os.MkdirAll("media/viewonce", 0755)
+	filename := fmt.Sprintf("%s.%s", msg.Info.ID, ext)
+	filePath := filepath.Join("media/viewonce", filename)
+
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		fmt.Printf("[AntiViewOnce] ❌ Failed to save ViewOnce file: %v\n", err)
+		return
+	}
+
+	ts := msg.Info.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	// Save metadata to SQLite
+	db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+	if err == nil {
+		defer db.Close()
+		_, _ = db.Exec(`
+			INSERT OR REPLACE INTO view_once_intercepts (id, account_phone, sender_jid, sender_phone, sender_name, media_type, filename, caption, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, string(msg.Info.ID), ownPhone, senderJID.String(), senderUser, senderName, mediaType, filename, caption, ts.Format(time.RFC3339))
+	}
+
+	// Notify Cloudflare Worker / Telegram
+	renderURL := os.Getenv("RENDER_EXTERNAL_URL")
+	if renderURL == "" {
+		renderURL = "https://whatsapp-bridge-server-0ia4.onrender.com"
+	}
+	renderURL = strings.TrimRight(renderURL, "/")
+	mediaURL := fmt.Sprintf("%s/media/viewonce/%s", renderURL, filename)
+
+	workerURL, bridgeSecret := getWorkerConfig()
+	notifyPayload, _ := json.Marshal(map[string]interface{}{
+		"secret":        bridgeSecret,
+		"message_id":    string(msg.Info.ID),
+		"sender_phone":  senderUser,
+		"sender_name":   senderName,
+		"account_phone": ownPhone,
+		"account_index": accIdx,
+		"caption":       caption,
+		"media_url":     mediaURL,
+		"is_video":      isVideo,
+	})
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	req, reqErr := http.NewRequest("POST", workerURL+"/api/notify-view-once", bytes.NewBuffer(notifyPayload))
+	if reqErr == nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Bridge-Secret", bridgeSecret)
+		resp, postErr := client.Do(req)
+		if postErr == nil {
+			defer resp.Body.Close()
+			fmt.Printf("[AntiViewOnce] 📲 Notified Cloudflare Worker, status: %d\n", resp.StatusCode)
+		} else {
+			fmt.Printf("[AntiViewOnce] ⚠️ Error notifying Cloudflare Worker: %v\n", postErr)
+		}
+	}
+}
+
 func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
 	if msg == nil {
 		return
 	}
+
+	// 1. Estados de WhatsApp (Status Broadcast)
 	if msg.Info.Chat == types.StatusBroadcastJID || msg.Info.Chat.User == "status" {
 		if msg.Info.IsFromMe {
 			ownPhone := ""
@@ -1623,6 +1777,23 @@ func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
 				ts = time.Now()
 			}
 			recordStatusPost(string(msg.Info.ID), ownPhone, caption, mediaType, ts)
+		}
+		return
+	}
+
+	// 2. Interceptar Mensajes de Vista Única (Guardián Anti-ViewOnce)
+	if msg.Message != nil {
+		var viewOnceInner *waProto.Message
+		if msg.Message.GetViewOnceMessage() != nil {
+			viewOnceInner = msg.Message.GetViewOnceMessage().GetMessage()
+		} else if msg.Message.GetViewOnceMessageV2() != nil {
+			viewOnceInner = msg.Message.GetViewOnceMessageV2().GetMessage()
+		} else if msg.Message.GetViewOnceMessageV2Extension() != nil {
+			viewOnceInner = msg.Message.GetViewOnceMessageV2Extension().GetMessage()
+		}
+
+		if viewOnceInner != nil {
+			go handleViewOnceIntercept(c, msg, viewOnceInner)
 		}
 	}
 }
@@ -3251,6 +3422,107 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		}
 		w.Header().Set("Content-Type", "video/mp4")
 		http.ServeFile(w, r, targetFile)
+	})
+
+	// Handler to serve intercepted ViewOnce media files
+	http.HandleFunc("/media/viewonce/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/media/viewonce/")
+		if name == "" || strings.Contains(name, "..") || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+			http.Error(w, "Invalid media filename", http.StatusBadRequest)
+			return
+		}
+		targetFile := filepath.Join("media/viewonce", name)
+		if _, err := os.Stat(targetFile); os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasSuffix(name, ".jpg") || strings.HasSuffix(name, ".jpeg") {
+			w.Header().Set("Content-Type", "image/jpeg")
+		} else if strings.HasSuffix(name, ".png") {
+			w.Header().Set("Content-Type", "image/png")
+		} else if strings.HasSuffix(name, ".mp4") {
+			w.Header().Set("Content-Type", "video/mp4")
+		} else if strings.HasSuffix(name, ".ogg") {
+			w.Header().Set("Content-Type", "audio/ogg")
+		}
+		http.ServeFile(w, r, targetFile)
+	})
+
+	// Handler for querying intercepted view-once messages
+	http.HandleFunc("/api/view-once-list", func(w http.ResponseWriter, r *http.Request) {
+		limit := 10
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+
+		db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+		defer db.Close()
+
+		rows, err := db.Query(`
+			SELECT id, account_phone, sender_phone, sender_name, media_type, filename, caption, created_at
+			FROM view_once_intercepts
+			ORDER BY created_at DESC
+			LIMIT ?
+		`, limit)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "items": []interface{}{}, "total": 0})
+			return
+		}
+		defer rows.Close()
+
+		renderURL := os.Getenv("RENDER_EXTERNAL_URL")
+		if renderURL == "" {
+			renderURL = "https://whatsapp-bridge-server-0ia4.onrender.com"
+		}
+		renderURL = strings.TrimRight(renderURL, "/")
+
+		type ViewOnceItem struct {
+			ID           string `json:"id"`
+			AccountPhone string `json:"account_phone"`
+			SenderPhone  string `json:"sender_phone"`
+			SenderName   string `json:"sender_name"`
+			MediaType    string `json:"media_type"`
+			Filename     string `json:"filename"`
+			MediaURL     string `json:"media_url"`
+			Caption      string `json:"caption"`
+			CreatedAt    string `json:"created_at"`
+			TimeAgo      string `json:"time_ago"`
+		}
+
+		items := []ViewOnceItem{}
+		for rows.Next() {
+			var id, accPhone, sPhone, sName, mType, fname, capStr, cAt string
+			if err := rows.Scan(&id, &accPhone, &sPhone, &sName, &mType, &fname, &capStr, &cAt); err == nil {
+				t := parseFlexibleTime(cAt)
+				items = append(items, ViewOnceItem{
+					ID:           id,
+					AccountPhone: accPhone,
+					SenderPhone:  sPhone,
+					SenderName:   sName,
+					MediaType:    mType,
+					Filename:     fname,
+					MediaURL:     fmt.Sprintf("%s/media/viewonce/%s", renderURL, fname),
+					Caption:      capStr,
+					CreatedAt:    cAt,
+					TimeAgo:      formatTimeAgo(t),
+				})
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"total":   len(items),
+			"items":   items,
+		})
 	})
 
 	// Handler for publishing to WhatsApp (Status & Nick chat) directly from Cloudflare Worker
