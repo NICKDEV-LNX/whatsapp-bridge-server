@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1865,6 +1866,7 @@ type PresenceState struct {
 	AccountPhone string    `json:"account_phone"`
 	AccountIndex int       `json:"account_index"`
 	Phone        string    `json:"phone"`
+	LID          string    `json:"lid,omitempty"`
 	Name         string    `json:"name"`
 	IsOnline     bool      `json:"is_online"`
 	LastSeen     time.Time `json:"last_seen,omitempty"`
@@ -1890,16 +1892,74 @@ func handlePresenceEvent(c *whatsmeow.Client, evt *events.Presence) {
 		return
 	}
 
-	contactName := "+" + userPhone
 	ctx := context.Background()
+	realPhone := userPhone
+	lid := ""
+
+	// 1. Resolve LID to real Phone Number if applicable
+	if evt.From.Server == types.HiddenUserServer || evt.From.Server == "lid" {
+		lid = userPhone
+		if c.Store != nil && c.Store.LIDs != nil {
+			if pn, err := c.Store.LIDs.GetPNForLID(ctx, evt.From); err == nil && !pn.IsEmpty() {
+				realPhone = pn.User
+			}
+		}
+		if realPhone == userPhone {
+			db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+			if err == nil {
+				var mappedPN string
+				_ = db.QueryRow("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", userPhone).Scan(&mappedPN)
+				if mappedPN != "" {
+					realPhone = mappedPN
+				}
+				db.Close()
+			}
+		}
+	}
+
+	// 2. Resolve Contact Name
+	contactName := "+" + realPhone
+	pnJID := types.NewJID(realPhone, types.DefaultUserServer)
 	if c.Store != nil && c.Store.Contacts != nil {
-		if contact, err := c.Store.Contacts.GetContact(ctx, evt.From); err == nil && contact.Found {
+		if contact, err := c.Store.Contacts.GetContact(ctx, pnJID); err == nil && contact.Found {
 			if contact.FullName != "" {
 				contactName = contact.FullName
 			} else if contact.PushName != "" {
 				contactName = contact.PushName
 			}
 		}
+		if contactName == "+"+realPhone {
+			if contact, err := c.Store.Contacts.GetContact(ctx, evt.From); err == nil && contact.Found {
+				if contact.FullName != "" {
+					contactName = contact.FullName
+				} else if contact.PushName != "" {
+					contactName = contact.PushName
+				}
+			}
+		}
+	}
+
+	// 3. Fallback to SQLite whatsmeow_contacts
+	if contactName == "+"+realPhone {
+		db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+		if err == nil {
+			var fn, pn string
+			_ = db.QueryRow("SELECT full_name, push_name FROM whatsmeow_contacts WHERE (their_jid LIKE ? OR their_jid LIKE ?) AND (full_name != '' OR push_name != '') LIMIT 1",
+				"%"+realPhone+"%", "%"+userPhone+"%").Scan(&fn, &pn)
+			if fn != "" {
+				contactName = fn
+			} else if pn != "" {
+				contactName = pn
+			}
+			db.Close()
+		}
+	}
+
+	// Friendly labels for sister accounts
+	if realPhone == "51910560649" {
+		contactName = "Cuenta 1 (Personal)"
+	} else if realPhone == "51917515837" {
+		contactName = "Cuenta 2 (Secundaria)"
 	}
 
 	multiLock.RLock()
@@ -1914,11 +1974,12 @@ func handlePresenceEvent(c *whatsmeow.Client, evt *events.Presence) {
 
 	isOnline := !evt.Unavailable
 	presenceMutex.Lock()
-	key := fmt.Sprintf("%s:%s", ownPhone, userPhone)
+	key := fmt.Sprintf("%s:%s", ownPhone, realPhone)
 	presenceMap[key] = &PresenceState{
 		AccountPhone: ownPhone,
 		AccountIndex: accIdx,
-		Phone:        userPhone,
+		Phone:        realPhone,
+		LID:          lid,
 		Name:         contactName,
 		IsOnline:     isOnline,
 		LastSeen:     evt.LastSeen,
@@ -1932,7 +1993,7 @@ func handlePresenceEvent(c *whatsmeow.Client, evt *events.Presence) {
 		statusStr = "🟢 EN LÍNEA"
 	}
 	debugLog("[Presence] Acc %d: %s (%s) %s (LastSeen: %v)",
-		accIdx, contactName, userPhone, statusStr, evt.LastSeen)
+		accIdx, contactName, realPhone, statusStr, evt.LastSeen)
 }
 
 func setupClientEventHandlers(c *whatsmeow.Client) {
@@ -3681,6 +3742,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 	// Handler to actively scan online presence of contacts across accounts
 	http.HandleFunc("/api/presence-scan", func(w http.ResponseWriter, r *http.Request) {
 		targetAccStr := r.URL.Query().Get("account") // "1", "2" or "" (both)
+		onlyOnline := r.URL.Query().Get("online") == "true" || r.URL.Query().Get("filter") == "online"
 
 		type AccountScanResult struct {
 			Index       int              `json:"index"`
@@ -3688,7 +3750,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			Subscribed  int              `json:"contacts_subscribed"`
 			TotalOnline int              `json:"total_online"`
 			OnlineList  []*PresenceState `json:"online_contacts"`
-			AllTracked  []*PresenceState `json:"all_tracked"`
+			AllTracked  []*PresenceState `json:"all_tracked,omitempty"`
 		}
 
 		multiLock.RLock()
@@ -3704,30 +3766,101 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 		multiLock.RUnlock()
 
 		ctx := r.Context()
+		accSubCounts := make(map[string]int)
+
 		for _, c := range clientsToScan {
+			ownPhone := ""
+			if c.Store != nil && c.Store.ID != nil {
+				ownPhone = c.Store.ID.ToNonAD().User
+			}
+
 			// Mark account as available to enable incoming presence packets
 			_ = c.SendPresence(ctx, types.PresenceAvailable)
 
+			// Collect candidate JIDs to subscribe
+			jidsToSub := make(map[types.JID]bool)
+
+			// 1. Explicitly subscribe to sister account
+			if ownPhone == "51910560649" {
+				jidsToSub[types.NewJID("51917515837", types.DefaultUserServer)] = true
+			} else if ownPhone == "51917515837" {
+				jidsToSub[types.NewJID("51910560649", types.DefaultUserServer)] = true
+			}
+
+			// 2. Contacts from Store.Contacts
 			if c.Store != nil && c.Store.Contacts != nil {
-				allC, err := c.Store.Contacts.GetAllContacts(ctx)
-				if err == nil {
-					count := 0
+				if allC, err := c.Store.Contacts.GetAllContacts(ctx); err == nil {
 					for jid := range allC {
-						if jid.Server == types.DefaultUserServer || jid.Server == "s.whatsapp.net" {
-							_ = c.SubscribePresence(ctx, jid)
-							count++
-							if count >= 100 { // Limit batch size to prevent WhatsApp server throttling
-								break
-							}
-							time.Sleep(3 * time.Millisecond)
+						if jid.Server == types.DefaultUserServer || jid.Server == "s.whatsapp.net" || jid.Server == types.HiddenUserServer || jid.Server == "lid" {
+							jidsToSub[jid] = true
 						}
 					}
 				}
 			}
+
+			// 3. Privacy blacklist & whitelist JIDs (essential for Account 2)
+			if priv, err := c.GetStatusPrivacy(ctx); err == nil {
+				for _, opt := range priv {
+					for _, j := range opt.List {
+						jidsToSub[j] = true
+						if (j.Server == types.HiddenUserServer || j.Server == "lid") && c.Store != nil && c.Store.LIDs != nil {
+							if pn, err := c.Store.LIDs.GetPNForLID(ctx, j); err == nil && !pn.IsEmpty() {
+								jidsToSub[pn] = true
+							}
+						}
+					}
+				}
+			}
+
+			// 4. Contacts from SQLite whatsmeow_lid_map & whatsmeow_contacts
+			db, err := sql.Open("sqlite", "file:store/whatsapp.db?_pragma=busy_timeout(5000)")
+			if err == nil {
+				rows, err := db.Query("SELECT pn, lid FROM whatsmeow_lid_map")
+				if err == nil {
+					for rows.Next() {
+						var pn, lid string
+						if err := rows.Scan(&pn, &lid); err == nil {
+							if pn != "" {
+								jidsToSub[types.NewJID(pn, types.DefaultUserServer)] = true
+							}
+							if lid != "" {
+								jidsToSub[types.NewJID(lid, types.HiddenUserServer)] = true
+							}
+						}
+					}
+					rows.Close()
+				}
+				cRows, cErr := db.Query("SELECT their_jid FROM whatsmeow_contacts")
+				if cErr == nil {
+					for cRows.Next() {
+						var theirJID string
+						if err := cRows.Scan(&theirJID); err == nil && theirJID != "" {
+							if parsed, err := types.ParseJID(theirJID); err == nil {
+								jidsToSub[parsed] = true
+							}
+						}
+					}
+					cRows.Close()
+				}
+				db.Close()
+			}
+
+			// Send presence subscriptions
+			subCount := 0
+			for jid := range jidsToSub {
+				_ = c.SubscribePresence(ctx, jid)
+				subCount++
+				if subCount >= 400 {
+					break
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+			accSubCounts[ownPhone] = subCount
+			debugLog("[PresenceScan] Subscribed %d contacts for account %s", subCount, ownPhone)
 		}
 
 		// Allow WebSocket packets to stream in
-		time.Sleep(2500 * time.Millisecond)
+		time.Sleep(3000 * time.Millisecond)
 
 		presenceMutex.RLock()
 		defer presenceMutex.RUnlock()
@@ -3744,6 +3877,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			allTracked := []*PresenceState{}
 			for _, st := range presenceMap {
 				if st.AccountPhone == phone || st.AccountIndex == accIdx {
+					if !st.LastSeen.IsZero() {
+						st.LastSeenAgo = formatTimeAgo(st.LastSeen)
+					}
 					allTracked = append(allTracked, st)
 					if st.IsOnline {
 						onlineList = append(onlineList, st)
@@ -3751,14 +3887,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 				}
 			}
 
-			results = append(results, AccountScanResult{
+			sort.Slice(onlineList, func(a, b int) bool {
+				return onlineList[a].UpdatedAt.After(onlineList[b].UpdatedAt)
+			})
+			sort.Slice(allTracked, func(a, b int) bool {
+				if allTracked[a].IsOnline != allTracked[b].IsOnline {
+					return allTracked[a].IsOnline
+				}
+				return allTracked[a].LastSeen.After(allTracked[b].LastSeen)
+			})
+
+			resItem := AccountScanResult{
 				Index:       accIdx,
 				Phone:       phone,
-				Subscribed:  len(allTracked),
+				Subscribed:  accSubCounts[phone],
 				TotalOnline: len(onlineList),
 				OnlineList:  onlineList,
-				AllTracked:  allTracked,
-			})
+			}
+			if !onlyOnline {
+				resItem.AllTracked = allTracked
+			}
+			results = append(results, resItem)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
