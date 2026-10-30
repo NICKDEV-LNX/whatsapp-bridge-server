@@ -1608,6 +1608,73 @@ func handleReceiptEvent(c *whatsmeow.Client, evt *events.Receipt) {
 	}
 }
 
+var (
+	recentDebugLogs   []string
+	debugLogMutex     sync.Mutex
+)
+
+func debugLog(format string, args ...any) {
+	msg := fmt.Sprintf("[%s] ", time.Now().Format("15:04:05")) + fmt.Sprintf(format, args...)
+	fmt.Println(msg)
+	debugLogMutex.Lock()
+	defer debugLogMutex.Unlock()
+	recentDebugLogs = append(recentDebugLogs, msg)
+	if len(recentDebugLogs) > 100 {
+		recentDebugLogs = recentDebugLogs[len(recentDebugLogs)-100:]
+	}
+}
+
+func unwrapViewOnce(msg *waProto.Message) *waProto.Message {
+	if msg == nil {
+		return nil
+	}
+	if msg.GetViewOnceMessage() != nil && msg.GetViewOnceMessage().GetMessage() != nil {
+		return unwrapViewOnce(msg.GetViewOnceMessage().GetMessage())
+	}
+	if msg.GetViewOnceMessageV2() != nil && msg.GetViewOnceMessageV2().GetMessage() != nil {
+		return unwrapViewOnce(msg.GetViewOnceMessageV2().GetMessage())
+	}
+	if msg.GetViewOnceMessageV2Extension() != nil && msg.GetViewOnceMessageV2Extension().GetMessage() != nil {
+		return unwrapViewOnce(msg.GetViewOnceMessageV2Extension().GetMessage())
+	}
+	if msg.GetEphemeralMessage() != nil && msg.GetEphemeralMessage().GetMessage() != nil {
+		return unwrapViewOnce(msg.GetEphemeralMessage().GetMessage())
+	}
+	if msg.GetDocumentWithCaptionMessage() != nil && msg.GetDocumentWithCaptionMessage().GetMessage() != nil {
+		return unwrapViewOnce(msg.GetDocumentWithCaptionMessage().GetMessage())
+	}
+	if (msg.GetImageMessage() != nil && msg.GetImageMessage().GetViewOnce()) ||
+		(msg.GetVideoMessage() != nil && msg.GetVideoMessage().GetViewOnce()) ||
+		(msg.GetAudioMessage() != nil && msg.GetAudioMessage().GetViewOnce()) {
+		return msg
+	}
+	if msg.GetImageMessage() != nil || msg.GetVideoMessage() != nil || msg.GetAudioMessage() != nil {
+		return msg
+	}
+	return nil
+}
+
+func isViewOnceMessage(msg *waProto.Message) (*waProto.Message, bool) {
+	if msg == nil {
+		return nil, false
+	}
+	isVO := msg.GetViewOnceMessage() != nil ||
+		msg.GetViewOnceMessageV2() != nil ||
+		msg.GetViewOnceMessageV2Extension() != nil ||
+		(msg.GetImageMessage() != nil && msg.GetImageMessage().GetViewOnce()) ||
+		(msg.GetVideoMessage() != nil && msg.GetVideoMessage().GetViewOnce()) ||
+		(msg.GetAudioMessage() != nil && msg.GetAudioMessage().GetViewOnce())
+
+	if !isVO && msg.GetEphemeralMessage() != nil {
+		return isViewOnceMessage(msg.GetEphemeralMessage().GetMessage())
+	}
+
+	if isVO {
+		return unwrapViewOnce(msg), true
+	}
+	return nil, false
+}
+
 func handleViewOnceIntercept(c *whatsmeow.Client, msg *events.Message, inner *waProto.Message) {
 	if c == nil || msg == nil || inner == nil {
 		return
@@ -1672,19 +1739,20 @@ func handleViewOnceIntercept(c *whatsmeow.Client, msg *events.Message, inner *wa
 		ext = "ogg"
 		caption = "Audio de Vista Única"
 	} else {
-		fmt.Printf("[AntiViewOnce] Unrecognized inner media type for msg %s\n", msg.Info.ID)
+		debugLog("[AntiViewOnce] Unrecognized inner media type for msg %s", msg.Info.ID)
 		return
 	}
 
-	fmt.Printf("[AntiViewOnce] 🚨 Intercepted ViewOnce %s from %s (+%s) to Acc %d (%s)!\n",
+	debugLog("[AntiViewOnce] 🚨 Intercepted ViewOnce %s from %s (+%s) to Acc %d (%s)!",
 		mediaType, senderName, senderUser, accIdx, ownPhone)
 
 	// Download media bytes using whatsmeow
 	data, err := c.DownloadAny(context.Background(), inner)
 	if err != nil {
-		fmt.Printf("[AntiViewOnce] ❌ Failed to download ViewOnce media %s: %v\n", msg.Info.ID, err)
+		debugLog("[AntiViewOnce] ❌ Failed to download ViewOnce media %s: %v", msg.Info.ID, err)
 		return
 	}
+	debugLog("[AntiViewOnce] ✅ Successfully downloaded %d bytes for ViewOnce %s", len(data), msg.Info.ID)
 
 	// Ensure directory exists
 	_ = os.MkdirAll("media/viewonce", 0755)
@@ -1692,7 +1760,7 @@ func handleViewOnceIntercept(c *whatsmeow.Client, msg *events.Message, inner *wa
 	filePath := filepath.Join("media/viewonce", filename)
 
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		fmt.Printf("[AntiViewOnce] ❌ Failed to save ViewOnce file: %v\n", err)
+		debugLog("[AntiViewOnce] ❌ Failed to save ViewOnce file: %v", err)
 		return
 	}
 
@@ -1740,9 +1808,9 @@ func handleViewOnceIntercept(c *whatsmeow.Client, msg *events.Message, inner *wa
 		resp, postErr := client.Do(req)
 		if postErr == nil {
 			defer resp.Body.Close()
-			fmt.Printf("[AntiViewOnce] 📲 Notified Cloudflare Worker, status: %d\n", resp.StatusCode)
+			debugLog("[AntiViewOnce] 📲 Notified Cloudflare Worker, status: %d", resp.StatusCode)
 		} else {
-			fmt.Printf("[AntiViewOnce] ⚠️ Error notifying Cloudflare Worker: %v\n", postErr)
+			debugLog("[AntiViewOnce] ⚠️ Error notifying Cloudflare Worker: %v", postErr)
 		}
 	}
 }
@@ -1751,6 +1819,9 @@ func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
 	if msg == nil {
 		return
 	}
+
+	chatStr := msg.Info.Chat.String()
+	debugLog("[MsgEvent] Chat=%s Sender=%s FromMe=%v MsgID=%s", chatStr, msg.Info.Sender, msg.Info.IsFromMe, msg.Info.ID)
 
 	// 1. Estados de WhatsApp (Status Broadcast)
 	if msg.Info.Chat == types.StatusBroadcastJID || msg.Info.Chat.User == "status" {
@@ -1783,17 +1854,9 @@ func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
 
 	// 2. Interceptar Mensajes de Vista Única (Guardián Anti-ViewOnce)
 	if msg.Message != nil {
-		var viewOnceInner *waProto.Message
-		if msg.Message.GetViewOnceMessage() != nil {
-			viewOnceInner = msg.Message.GetViewOnceMessage().GetMessage()
-		} else if msg.Message.GetViewOnceMessageV2() != nil {
-			viewOnceInner = msg.Message.GetViewOnceMessageV2().GetMessage()
-		} else if msg.Message.GetViewOnceMessageV2Extension() != nil {
-			viewOnceInner = msg.Message.GetViewOnceMessageV2Extension().GetMessage()
-		}
-
-		if viewOnceInner != nil {
-			go handleViewOnceIntercept(c, msg, viewOnceInner)
+		if inner, isVO := isViewOnceMessage(msg.Message); isVO && inner != nil {
+			debugLog("[AntiViewOnce] 🔍 Detected ViewOnce message %s! Triggering intercept...", msg.Info.ID)
+			go handleViewOnceIntercept(c, msg, inner)
 		}
 	}
 }
@@ -3522,6 +3585,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			"success": true,
 			"total":   len(items),
 			"items":   items,
+		})
+	})
+
+	// Handler for querying recent in-memory debug logs
+	http.HandleFunc("/api/debug-logs", func(w http.ResponseWriter, r *http.Request) {
+		debugLogMutex.Lock()
+		logs := make([]string, len(recentDebugLogs))
+		copy(logs, recentDebugLogs)
+		debugLogMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"total":   len(logs),
+			"logs":    logs,
 		})
 	})
 
