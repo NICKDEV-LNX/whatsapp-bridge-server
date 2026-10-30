@@ -1861,6 +1861,80 @@ func handleMessageEvent(c *whatsmeow.Client, msg *events.Message) {
 	}
 }
 
+type PresenceState struct {
+	AccountPhone string    `json:"account_phone"`
+	AccountIndex int       `json:"account_index"`
+	Phone        string    `json:"phone"`
+	Name         string    `json:"name"`
+	IsOnline     bool      `json:"is_online"`
+	LastSeen     time.Time `json:"last_seen,omitempty"`
+	LastSeenAgo  string    `json:"last_seen_ago,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+var (
+	presenceMap   = make(map[string]*PresenceState)
+	presenceMutex sync.RWMutex
+)
+
+func handlePresenceEvent(c *whatsmeow.Client, evt *events.Presence) {
+	if c == nil || evt == nil {
+		return
+	}
+	ownPhone := ""
+	if c.Store != nil && c.Store.ID != nil {
+		ownPhone = c.Store.ID.ToNonAD().User
+	}
+	userPhone := evt.From.User
+	if userPhone == "" {
+		return
+	}
+
+	contactName := "+" + userPhone
+	ctx := context.Background()
+	if c.Store != nil && c.Store.Contacts != nil {
+		if contact, err := c.Store.Contacts.GetContact(ctx, evt.From); err == nil && contact.Found {
+			if contact.FullName != "" {
+				contactName = contact.FullName
+			} else if contact.PushName != "" {
+				contactName = contact.PushName
+			}
+		}
+	}
+
+	multiLock.RLock()
+	accIdx := 0
+	for idx, cli := range allClients {
+		if cli == c {
+			accIdx = idx + 1
+			break
+		}
+	}
+	multiLock.RUnlock()
+
+	isOnline := !evt.Unavailable
+	presenceMutex.Lock()
+	key := fmt.Sprintf("%s:%s", ownPhone, userPhone)
+	presenceMap[key] = &PresenceState{
+		AccountPhone: ownPhone,
+		AccountIndex: accIdx,
+		Phone:        userPhone,
+		Name:         contactName,
+		IsOnline:     isOnline,
+		LastSeen:     evt.LastSeen,
+		LastSeenAgo:  formatTimeAgo(evt.LastSeen),
+		UpdatedAt:    time.Now(),
+	}
+	presenceMutex.Unlock()
+
+	statusStr := "🔴 Desconectado"
+	if isOnline {
+		statusStr = "🟢 EN LÍNEA"
+	}
+	debugLog("[Presence] Acc %d: %s (%s) %s (LastSeen: %v)",
+		accIdx, contactName, userPhone, statusStr, evt.LastSeen)
+}
+
 func setupClientEventHandlers(c *whatsmeow.Client) {
 	if c == nil {
 		return
@@ -1871,6 +1945,8 @@ func setupClientEventHandlers(c *whatsmeow.Client) {
 			handleReceiptEvent(c, evt)
 		case *events.Message:
 			handleMessageEvent(c, evt)
+		case *events.Presence:
+			handlePresenceEvent(c, evt)
 		}
 	})
 }
@@ -3599,6 +3675,97 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			"success": true,
 			"total":   len(logs),
 			"logs":    logs,
+		})
+	})
+
+	// Handler to actively scan online presence of contacts across accounts
+	http.HandleFunc("/api/presence-scan", func(w http.ResponseWriter, r *http.Request) {
+		targetAccStr := r.URL.Query().Get("account") // "1", "2" or "" (both)
+
+		type AccountScanResult struct {
+			Index       int              `json:"index"`
+			Phone       string           `json:"phone"`
+			Subscribed  int              `json:"contacts_subscribed"`
+			TotalOnline int              `json:"total_online"`
+			OnlineList  []*PresenceState `json:"online_contacts"`
+			AllTracked  []*PresenceState `json:"all_tracked"`
+		}
+
+		multiLock.RLock()
+		clientsToScan := []*whatsmeow.Client{}
+		for i, c := range allClients {
+			if targetAccStr != "" && strconv.Itoa(i+1) != targetAccStr {
+				continue
+			}
+			if c != nil && c.IsConnected() {
+				clientsToScan = append(clientsToScan, c)
+			}
+		}
+		multiLock.RUnlock()
+
+		ctx := r.Context()
+		for _, c := range clientsToScan {
+			// Mark account as available to enable incoming presence packets
+			_ = c.SendPresence(ctx, types.PresenceAvailable)
+
+			if c.Store != nil && c.Store.Contacts != nil {
+				allC, err := c.Store.Contacts.GetAllContacts(ctx)
+				if err == nil {
+					count := 0
+					for jid := range allC {
+						if jid.Server == types.DefaultUserServer || jid.Server == "s.whatsapp.net" {
+							_ = c.SubscribePresence(ctx, jid)
+							count++
+							if count >= 100 { // Limit batch size to prevent WhatsApp server throttling
+								break
+							}
+							time.Sleep(3 * time.Millisecond)
+						}
+					}
+				}
+			}
+		}
+
+		// Allow WebSocket packets to stream in
+		time.Sleep(2500 * time.Millisecond)
+
+		presenceMutex.RLock()
+		defer presenceMutex.RUnlock()
+
+		var results []AccountScanResult
+		for i, c := range clientsToScan {
+			phone := ""
+			if c.Store != nil && c.Store.ID != nil {
+				phone = c.Store.ID.ToNonAD().User
+			}
+			accIdx := i + 1
+
+			onlineList := []*PresenceState{}
+			allTracked := []*PresenceState{}
+			for _, st := range presenceMap {
+				if st.AccountPhone == phone || st.AccountIndex == accIdx {
+					allTracked = append(allTracked, st)
+					if st.IsOnline {
+						onlineList = append(onlineList, st)
+					}
+				}
+			}
+
+			results = append(results, AccountScanResult{
+				Index:       accIdx,
+				Phone:       phone,
+				Subscribed:  len(allTracked),
+				TotalOnline: len(onlineList),
+				OnlineList:  onlineList,
+				AllTracked:  allTracked,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"scanned":  len(results),
+			"accounts": results,
 		})
 	})
 
