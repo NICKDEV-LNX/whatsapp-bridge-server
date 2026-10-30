@@ -762,13 +762,17 @@ type SendMessageResponse struct {
 
 type SendMessageRequest struct {
 
-	Recipient string   `json:"recipient"`
+	AccountIndex int      `json:"account_index,omitempty"`
 
-	Message   string   `json:"message"`
+	Recipient    string   `json:"recipient"`
 
-	MediaPath string   `json:"media_path,omitempty"`
+	Message      string   `json:"message"`
 
-	Mentions  []string `json:"mentions,omitempty"`
+	MediaPath    string   `json:"media_path,omitempty"`
+
+	Mentions     []string `json:"mentions,omitempty"`
+
+	ViewOnce     bool     `json:"view_once,omitempty"`
 
 }
 
@@ -937,6 +941,10 @@ func sanitizeContactsForStatusPrivacy(c *whatsmeow.Client) (int, error) {
 // Function to send a WhatsApp message
 
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, mentions []string) (bool, string) {
+	return sendWhatsAppMessageFull(client, recipient, message, mediaPath, mentions, false)
+}
+
+func sendWhatsAppMessageFull(client *whatsmeow.Client, recipient string, message string, mediaPath string, mentions []string, viewOnce bool) (bool, string) {
 
 	if !client.IsConnected() {
 
@@ -1386,7 +1394,28 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	}
 
-
+	// Apply ViewOnce if requested for media messages in private or group chats
+	if viewOnce && recipientJID.Server != "broadcast" {
+		if msg.ImageMessage != nil {
+			msg.ImageMessage.ViewOnce = proto.Bool(true)
+			inner := msg
+			msg = &waProto.Message{
+				ViewOnceMessageV2: &waProto.FutureProofMessage{
+					Message: inner,
+				},
+			}
+			fmt.Printf("[Bridge] 🔒 Configured ViewOnceV2 for image to %s\n", recipientJID.String())
+		} else if msg.VideoMessage != nil {
+			msg.VideoMessage.ViewOnce = proto.Bool(true)
+			inner := msg
+			msg = &waProto.Message{
+				ViewOnceMessageV2: &waProto.FutureProofMessage{
+					Message: inner,
+				},
+			}
+			fmt.Printf("[Bridge] 🔒 Configured ViewOnceV2 for video to %s\n", recipientJID.String())
+		}
+	}
 
 	// Send message
 
@@ -2665,13 +2694,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 
 
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Printf("Received request to send message: msg=%q media=%q view_once=%v acc=%d to=%s\n",
+			req.Message, req.MediaPath, req.ViewOnce, req.AccountIndex, req.Recipient)
 
-
+		// Select client based on account_index (default to primary client)
+		targetCli := client
+		if req.AccountIndex > 0 {
+			multiLock.RLock()
+			if req.AccountIndex <= len(allClients) && allClients[req.AccountIndex-1] != nil {
+				targetCli = allClients[req.AccountIndex-1]
+			}
+			multiLock.RUnlock()
+		}
 
 		// Send the message
-
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.Mentions)
+		success, message := sendWhatsAppMessageFull(targetCli, req.Recipient, req.Message, req.MediaPath, req.Mentions, req.ViewOnce)
 
 		fmt.Println("Message sent", success, message)
 
