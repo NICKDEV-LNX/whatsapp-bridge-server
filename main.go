@@ -3536,14 +3536,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		// Extract YouTube ID
-		re := regexp.MustCompile(`(?:shorts/|v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})`)
+		// Extract Media/Video ID (YouTube, Facebook, Reels, Shorts, etc.)
+		re := regexp.MustCompile(`(?:shorts/|v=|youtu\.be/|embed/|reel/|reels/|videos/)([a-zA-Z0-9_-]+)`)
 		matches := re.FindStringSubmatch(targetURL)
-		vidID := "yt_clip"
+		vidID := "media_clip"
 		if len(matches) > 1 {
 			vidID = matches[1]
+			if len(vidID) > 25 {
+				vidID = vidID[:25]
+			}
 		} else {
-			vidID = fmt.Sprintf("yt_%d", time.Now().UnixNano())
+			vidID = fmt.Sprintf("clip_%d", time.Now().UnixNano())
 		}
 
 		outputPath := filepath.Join(os.TempDir(), fmt.Sprintf("yt_%s.mp4", vidID))
