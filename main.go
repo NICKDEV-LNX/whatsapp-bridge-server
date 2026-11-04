@@ -3536,8 +3536,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, defau
 			return
 		}
 
-		// Extract Media/Video ID (YouTube, Facebook, Reels, Shorts, etc.)
-		re := regexp.MustCompile(`(?:shorts/|v=|youtu\.be/|embed/|reel/|reels/|videos/)([a-zA-Z0-9_-]+)`)
+		// Extract Media/Video ID (YouTube, Facebook, Reels, Shorts, Share links, etc.)
+		re := regexp.MustCompile(`(?:shorts/|v=|youtu\.be/|embed/|reel/|reels/|videos/|share/[rvp]/|fb\.watch/)([a-zA-Z0-9_-]+)`)
 		matches := re.FindStringSubmatch(targetURL)
 		vidID := "media_clip"
 		if len(matches) > 1 {
